@@ -3,6 +3,7 @@ import os
 import re
 import json
 import uuid
+import hashlib
 import asyncio
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -133,6 +134,39 @@ def surface_summary(surface: dict) -> str:
 
 
 # ----------------------------------------------------------------------------
+# Agent memory (cross-run learning, keyed per target URL)
+# ----------------------------------------------------------------------------
+def _memory_key(url: str) -> str:
+    """Normalize a target URL into a stable agent-memory key (host + path, no query/fragment)."""
+    p = urlparse(url)
+    return f"{p.netloc.lower()}{p.path.rstrip('/')}" or url
+
+
+def _stable_hash(items) -> str:
+    """Cross-process-stable hash (Python's builtin hash() is salted per-process, so it can't be
+    used to compare a cached value against a freshly computed one across backend restarts)."""
+    return hashlib.md5("|".join(items or []).encode("utf-8")).hexdigest()[:16]
+
+
+def _detect_insights(flow_history: dict, flow_heal_counts: dict, recurring_defects: list) -> dict:
+    """Pure pattern-learning pass over accumulated per-target memory. No I/O, no LLM -- just
+    counts and history already gathered during persist, so it's cheap to run every run."""
+    flaky = []
+    bad = {"defect", "review"}
+    for sig, outcomes in flow_history.items():
+        if len(outcomes) < 2:
+            continue
+        has_bad = any(o in bad for o in outcomes)
+        has_good = any(o not in bad for o in outcomes)
+        if has_bad and has_good:
+            flaky.append(sig)
+    confirmed_regressions = [d for d in recurring_defects if d.get("count", 0) >= 2]
+    unstable_selector_flows = [sig for sig, cnt in flow_heal_counts.items() if cnt >= 2]
+    return {"flaky_flows": flaky, "confirmed_regressions": confirmed_regressions,
+            "unstable_selector_flows": unstable_selector_flows}
+
+
+# ----------------------------------------------------------------------------
 # Orchestrator
 # ----------------------------------------------------------------------------
 class Orchestrator:
@@ -170,6 +204,28 @@ class Orchestrator:
             {"from": frm, "to": to, "artifact": artifact, "summary": summary},
         )
 
+    # ---- MEMORY (recall) ----
+    async def _stage_recall_memory(self, run_id, config):
+        key = _memory_key(config["url"])
+        mem = await self.db.agent_memory.find_one({"key": key}, {"_id": 0})
+        if mem:
+            await self.emit(run_id, "EXPLORE", "memory", "info", "memory_recall",
+                            f"Recalling agent memory for {key}: this is run #{mem.get('run_count', 0) + 1} on "
+                            f"this target ({len(mem.get('known_selectors', []))} known selectors, "
+                            f"{len(mem.get('healed_locators', {}))} previously healed locator(s), "
+                            f"{len(mem.get('recurring_defects', []))} recurring defect pattern(s) tracked).",
+                            {"memory_summary": {
+                                "run_count": mem.get("run_count", 0),
+                                "known_selectors": len(mem.get("known_selectors", [])),
+                                "healed_locators": len(mem.get("healed_locators", {})),
+                                "recurring_defects": len(mem.get("recurring_defects", [])),
+                            }})
+            return mem
+        await self.emit(run_id, "EXPLORE", "memory", "info", "memory_recall",
+                        f"No prior memory for {key} — first run on this target.")
+        return {"key": key, "run_count": 0, "known_selectors": [], "healed_locators": {},
+                "recurring_defects": [], "coverage_gap_areas": {}}
+
     async def run(self, run_id: str, config: dict):
         _resume_events[run_id] = asyncio.Event()
         models = config.get("models", {})
@@ -183,9 +239,10 @@ class Orchestrator:
                             f"Meta-agent initialized. Target: {config['url']}",
                             {"config": {k: config.get(k) for k in ["url", "login_url", "intent", "budget", "auth_mode"]}})
 
+            memory = await self._stage_recall_memory(run_id, config)
             surface = await self._stage_explore(run_id, config)
-            plan = await self._stage_plan(run_id, config, surface, m("planner"))
-            plan, evaluation = await self._stage_evaluate(run_id, config, surface, plan, m("evaluator"))
+            plan = await self._stage_plan(run_id, config, surface, m("planner"), memory=memory)
+            plan, evaluation = await self._stage_evaluate(run_id, config, surface, plan, m("evaluator"), memory=memory)
 
             # meta-agent decision: a real audit finding found serious gaps -> re-invoke the Planner
             # once with that feedback before locking the plan, rather than generating tests for a
@@ -202,8 +259,8 @@ class Orchestrator:
                     run_id, "EVALUATE", "evaluator", "planner", "feedback",
                     f"{len(high_gaps)} high-severity coverage gap(s), {n_prd} PRD gap(s)",
                     level="warn")
-                plan = await self._stage_plan(run_id, config, surface, m("planner"), feedback=evaluation)
-                plan, evaluation = await self._stage_evaluate(run_id, config, surface, plan, m("evaluator"), second_pass=True)
+                plan = await self._stage_plan(run_id, config, surface, m("planner"), feedback=evaluation, memory=memory)
+                plan, evaluation = await self._stage_evaluate(run_id, config, surface, plan, m("evaluator"), second_pass=True, memory=memory)
 
             # optional pause gate
             if config.get("pause_after_plan"):
@@ -228,10 +285,11 @@ class Orchestrator:
                 run_id, "EVALUATE", "evaluator", "generator", "evaluation",
                 f"{n_gaps} gaps, {n_added} flows auto-added{eval_fb}")
 
-            specs = await self._stage_generate(run_id, config, surface, plan, m("generator"))
+            specs = await self._stage_generate(run_id, config, surface, plan, m("generator"), memory=memory)
             executions = await self._stage_run(run_id, config, surface, specs)
-            healer = await self._stage_heal(run_id, config, surface, executions, specs, m("healer"))
+            healer = await self._stage_heal(run_id, config, surface, executions, specs, m("healer"), memory=memory)
             await self._stage_report(run_id, config, surface, plan, specs, executions, healer)
+            await self._stage_persist_memory(run_id, config, memory, plan, specs, healer)
 
             await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "completed", "finished_at": now_iso()}})
             await self.emit(run_id, "REPORT", "meta", "success", "run_complete",
@@ -302,7 +360,8 @@ class Orchestrator:
         return surface
 
     # ---- PLAN ----
-    async def _stage_plan(self, run_id, config, surface, model, feedback=None):
+    async def _stage_plan(self, run_id, config, surface, model, feedback=None, memory=None):
+        memory = memory or {}
         await self.set_stage(run_id, "PLAN", "running")
         label = "re-planning" if feedback else "synthesizing"
         await self.emit(run_id, "PLAN", "planner", "info", "stage_start",
@@ -316,6 +375,14 @@ class Orchestrator:
         prompt = (f"TARGET SURFACE:\n{surface_summary(surface)}\n\n"
                   f"PRD:\n{config.get('prd') or 'none provided'}\n\n"
                   f"NL TEST INTENT:\n{config.get('intent') or 'none'}\n\n")
+        if memory.get("run_count"):
+            recurring = memory.get("recurring_defects", [])
+            gap_areas = memory.get("coverage_gap_areas", {})
+            prompt += (f"MEMORY FROM {memory['run_count']} PRIOR RUN(S) ON THIS TARGET:\n"
+                       f"- Recurring defects: "
+                       f"{json.dumps([{'flow': d.get('flow_name'), 'fail_type': d.get('fail_type'), 'seen': d.get('count')} for d in recurring]) if recurring else 'none'}\n"
+                       f"- Persistent coverage gap areas: {json.dumps(gap_areas) if gap_areas else 'none'}\n"
+                       "Prioritize flows that re-test these known trouble spots.\n\n")
         if feedback:
             prompt += (f"A PLAN EVALUATOR AUDITED YOUR PREVIOUS PLAN AND FOUND THESE GAPS — the new plan MUST "
                        f"address them explicitly:\n{json.dumps(feedback)[:1500]}\n\n")
@@ -346,7 +413,8 @@ class Orchestrator:
         return flows
 
     # ---- EVALUATE ----
-    async def _stage_evaluate(self, run_id, config, surface, flows, model, second_pass=False):
+    async def _stage_evaluate(self, run_id, config, surface, flows, model, second_pass=False, memory=None):
+        memory = memory or {}
         await self.set_stage(run_id, "EVALUATE", "running")
         await self.emit(run_id, "EVALUATE", "evaluator", "info", "stage_start",
                         f"Plan Evaluator ({model}) auditing coverage gaps before generation...")
@@ -390,10 +458,30 @@ class Orchestrator:
             flows.append(f)
             await self.emit(run_id, "EVALUATE", "evaluator", "info", "plan_flow",
                             f"Auto-added missing flow: {f['name']}", {"flow": f})
-        # enforce run budget to keep the pipeline fast & within LLM rate limits
+        # deterministic regression escalation: a defect signature seen >=2x on this target gets a
+        # dedicated regression-check flow forced into the plan, independent of what the LLM decided
+        existing_names = {f["name"].lower() for f in flows}
+        confirmed = [d for d in memory.get("recurring_defects", []) if d.get("count", 0) >= 2]
+        for d in confirmed:
+            label = f"Regression check: {d['flow_name']}"
+            if label.lower() in existing_names:
+                continue
+            rf = {"flow_id": f"F{len(flows)+1}", "name": label, "type": "error", "priority": "high",
+                  "steps": [f"Re-run '{d['flow_name']}' and confirm the previously seen "
+                            f"{d['fail_type']} does not reoccur"],
+                  "expected_outcome": f"{d['fail_type']} does not reoccur",
+                  "selectors": [], "added_by_evaluator": True, "added_from_memory": True}
+            flows.append(rf)
+            existing_names.add(label.lower())
+            await self.emit(run_id, "EVALUATE", "evaluator", "warn", "plan_flow",
+                            f"Auto-added regression-check flow from memory: {label} "
+                            f"(seen {d['count']}x previously on this target)", {"flow": rf})
+        # enforce run budget to keep the pipeline fast & within LLM rate limits -- high-priority
+        # flows (including memory-forced regression checks) survive capping first
         cap = {"quick": 4, "standard": 5, "thorough": 7}.get(config.get("budget"), 5)
         if len(flows) > cap:
-            flows = flows[:cap]
+            order = {"high": 0, "medium": 1, "low": 2}
+            flows = sorted(flows, key=lambda f: order.get(f.get("priority", "medium"), 1))[:cap]
         for idx, f in enumerate(flows):
             f["flow_id"] = f"F{idx+1}"
         persist_eval = {k: v for k, v in data.items() if k != "_fallback"}
@@ -407,36 +495,57 @@ class Orchestrator:
         return flows, data
 
     # ---- GENERATE ----
-    async def _stage_generate(self, run_id, config, surface, flows, model):
+    async def _stage_generate(self, run_id, config, surface, flows, model, memory=None):
+        memory = memory or {}
         await self.set_stage(run_id, "GENERATE", "running")
         await self.emit(run_id, "GENERATE", "generator", "info", "stage_start",
                         f"Generator ({model}) writing Playwright specs with live selector validation...")
         known_selectors = _known_selectors(surface)
+        memory_selectors = list(dict.fromkeys(
+            list(memory.get("healed_locators", {}).values()) + list(memory.get("known_selectors", []))))
+        if memory_selectors:
+            await self.emit(run_id, "GENERATE", "generator", "info", "log",
+                            f"Reusing {len(memory_selectors)} selector(s) proven stable on this target across "
+                            f"{memory.get('run_count', 0)} prior run(s), including any previously healed locators.")
+            known_selectors = list(dict.fromkeys(memory_selectors + known_selectors))
+        cached_specs = memory.get("cached_specs", {})
+        flow_heal_counts = memory.get("flow_heal_counts", {})
         specs = []
         used_fallback = False
         for f in flows:
-            system = ("You are a Playwright test generator. Write ONE complete Playwright test spec (JavaScript, "
-                      "@playwright/test) for the given flow. Use realistic locators, auto-waiting, and assertions. "
-                      "Return ONLY JSON: {\"filename\":\"flow-name.spec.js\",\"code\":\"<full spec>\","
-                      "\"selectors\":[\"locator1\",\"locator2\"]}")
-            prompt = (f"TARGET: {config['url']}\nFLOW: {json.dumps(f)}\n"
-                      f"KNOWN VALID SELECTORS ON PAGE: {json.dumps(known_selectors[:20])}\n"
-                      f"AUTH: {'reuse storageState.json' if config.get('auth_mode')=='authenticated' else 'public'}\n"
-                      "Generate the spec.")
-            data, _ = await self._safe_llm(system, prompt, model, run_id, "GENERATE", "generator")
-            data = data if isinstance(data, dict) else {}
-            if data.get("code"):
-                code = data["code"]
+            sig = _slug(f["name"])
+            steps_hash = _stable_hash(f.get("steps", []))
+            cached = cached_specs.get(sig)
+            # reuse a spec verbatim only if this exact flow (by steps) was stable last time it ran
+            # here -- a flow that has needed >=2 heals gets regenerated fresh instead of trusted
+            if cached and cached.get("steps_hash") == steps_hash and flow_heal_counts.get(sig, 0) < 2:
+                code, filename, sels = cached["code"], cached["filename"], cached["selectors"]
+                await self.emit(run_id, "GENERATE", "generator", "info", "log",
+                                f"Reusing cached spec for '{f['name']}' — unchanged flow with stable "
+                                "selectors from a prior run; skipping regeneration.")
             else:
-                code = _fallback_spec(f, config["url"])
-                used_fallback = True
-            filename = data.get("filename") or f"{_slug(f['name'])}.spec.js"
-            # the LLM (in PLAN or here) occasionally returns "selectors" as a plain string instead
-            # of a JSON array despite the schema asking for one — iterating a string in Python walks
-            # it character-by-character, silently producing garbage single-char "selectors", so coerce.
-            sels = data.get("selectors") or f.get("selectors") or []
-            if isinstance(sels, str):
-                sels = [sels] if sels.strip() else []
+                system = ("You are a Playwright test generator. Write ONE complete Playwright test spec (JavaScript, "
+                          "@playwright/test) for the given flow. Use realistic locators, auto-waiting, and assertions. "
+                          "Return ONLY JSON: {\"filename\":\"flow-name.spec.js\",\"code\":\"<full spec>\","
+                          "\"selectors\":[\"locator1\",\"locator2\"]}")
+                prompt = (f"TARGET: {config['url']}\nFLOW: {json.dumps(f)}\n"
+                          f"KNOWN VALID SELECTORS ON PAGE: {json.dumps(known_selectors[:20])}\n"
+                          f"AUTH: {'reuse storageState.json' if config.get('auth_mode')=='authenticated' else 'public'}\n"
+                          "Generate the spec.")
+                data, _ = await self._safe_llm(system, prompt, model, run_id, "GENERATE", "generator")
+                data = data if isinstance(data, dict) else {}
+                if data.get("code"):
+                    code = data["code"]
+                else:
+                    code = _fallback_spec(f, config["url"])
+                    used_fallback = True
+                filename = data.get("filename") or f"{_slug(f['name'])}.spec.js"
+                # the LLM (in PLAN or here) occasionally returns "selectors" as a plain string instead
+                # of a JSON array despite the schema asking for one — iterating a string in Python walks
+                # it character-by-character, silently producing garbage single-char "selectors", so coerce.
+                sels = data.get("selectors") or f.get("selectors") or []
+                if isinstance(sels, str):
+                    sels = [sels] if sels.strip() else []
             # live selector validation against discovered surface
             validated = []
             for s in sels:
@@ -552,7 +661,11 @@ class Orchestrator:
         return executions
 
     # ---- HEAL ----
-    async def _stage_heal(self, run_id, config, surface, executions, specs, model):
+    async def _stage_heal(self, run_id, config, surface, executions, specs, model, memory=None):
+        memory = memory or {}
+        healed_locators = memory.get("healed_locators", {})
+        confirmed_map = {d["signature"]: d for d in memory.get("recurring_defects", [])
+                         if d.get("count", 0) >= 2}
         await self.set_stage(run_id, "HEAL", "running")
         failures = [e for e in executions if e["status"] == "failed"]
         known = _known_selectors(surface)
@@ -562,9 +675,16 @@ class Orchestrator:
         actions = []
         for e in failures:
             ft = e.get("fail_type")
+            stale_sel = e.get("error", "").split("`")[1] if "`" in e.get("error", "") else None
+            remembered_new = healed_locators.get(stale_sel) if stale_sel else None
+            confirmed = confirmed_map.get(f"{e['flow_name']}::{ft}")
             # heuristic-first decision — deterministic for clear signals
             if ft == "selector-not-found":
-                forced, base_conf = "script", 0.91
+                forced, base_conf = "script", (0.97 if remembered_new else 0.91)
+            elif confirmed:
+                # this exact failure signature has already recurred >=2x on this target -- no need
+                # to re-litigate with the LLM, it's a confirmed regression by definition
+                forced, base_conf = "defect", 0.95
             elif ft in ("network-5xx", "console-exception"):
                 forced, base_conf = "defect", 0.9
             else:  # assertion-failed -> ambiguous, let LLM arbitrate
@@ -591,14 +711,20 @@ class Orchestrator:
             rationale = data.get("rationale") or _default_rationale(ft, decision)
             heal = data.get("heal") or {}
             if decision == "script" and not heal.get("new_selector"):
-                old_sel = e.get("error", "").split("`")[1] if "`" in e.get("error", "") else "stale locator"
-                new_sel = (next((k for k in known if "data-testid" in k), None)
+                old_sel = stale_sel or "stale locator"
+                new_sel = (remembered_new or next((k for k in known if "data-testid" in k), None)
                            or "getByRole('button', { name: /submit/i })")
                 heal = {"old_selector": old_sel, "new_selector": new_sel}
+                if remembered_new:
+                    rationale = f"{rationale} Reusing the fix already learned from a previous run on this target."
+            if confirmed:
+                rationale = (f"{rationale} This failure signature has now recurred "
+                             f"{confirmed['count'] + 1} time(s) across runs on this target — confirmed regression.")
+            default_severity = "critical" if confirmed else ("high" if decision == "defect" else "low")
             action = {"id": str(uuid.uuid4()), "run_id": run_id, "execution_id": e["id"], "flow_id": e["flow_id"],
                       "flow_name": e["flow_name"], "fail_type": ft, "decision": decision,
                       "confidence": round(confidence, 2), "rationale": rationale,
-                      "heal": heal, "severity": data.get("severity") or ("high" if decision == "defect" else "low")}
+                      "heal": heal, "severity": data.get("severity") or default_severity}
 
             if decision == "script":
                 # a proposed heal is only provisional until replayed for real, and HEAL is not the
@@ -773,6 +899,122 @@ class Orchestrator:
                         "Final test-quality report aggregated and persisted.")
         await self.set_stage(run_id, "REPORT", "done")
         return report
+
+    # ---- MEMORY (persist) ----
+    async def _stage_persist_memory(self, run_id, config, memory, flows, specs, actions):
+        key = _memory_key(config["url"])
+        known_selectors = list(memory.get("known_selectors", []))
+        for spec in specs:
+            for v in spec.get("selectors", []):
+                if v.get("status") in ("verified", "healed") and v["selector"] not in known_selectors:
+                    known_selectors.append(v["selector"])
+        known_selectors = known_selectors[-50:]
+
+        healed_locators = dict(memory.get("healed_locators", {}))
+        for a in actions:
+            heal = a.get("heal") or {}
+            if a.get("decision") == "script" and a.get("healed") and heal.get("old_selector") and heal.get("new_selector"):
+                healed_locators[heal["old_selector"]] = heal["new_selector"]
+
+        recurring = {d["signature"]: dict(d) for d in memory.get("recurring_defects", [])}
+        for a in actions:
+            if a.get("decision") == "defect":
+                sig = f"{a['flow_name']}::{a['fail_type']}"
+                entry = recurring.get(sig, {"signature": sig, "flow_name": a["flow_name"],
+                                             "fail_type": a["fail_type"], "count": 0})
+                entry["count"] += 1
+                entry["last_seen"] = now_iso()
+                entry["last_severity"] = a.get("severity")
+                entry["last_rationale"] = a.get("rationale")
+                entry["confirmed_regression"] = entry["count"] >= 2
+                recurring[sig] = entry
+
+        plan_doc = await self.db.plans.find_one({"run_id": run_id}, {"_id": 0})
+        gap_areas = dict(memory.get("coverage_gap_areas", {}))
+        for g in (plan_doc or {}).get("evaluation", {}).get("coverage_gaps", []):
+            area = g.get("area") or "unspecified"
+            gap_areas[area] = gap_areas.get(area, 0) + 1
+
+        # per-flow outcome/heal history -- drives flaky-flow and chronic-selector-instability detection
+        finals = await self.db.executions.find({"run_id": run_id}, {"_id": 0}).to_list(1000)
+        flow_history = {k: list(v) for k, v in memory.get("flow_history", {}).items()}
+        flow_names = dict(memory.get("flow_names", {}))
+        for ex in finals:
+            sig = _slug(ex["flow_name"])
+            flow_names[sig] = ex["flow_name"]
+            flow_history[sig] = (flow_history.get(sig, []) + [ex["final_status"]])[-10:]
+        flow_heal_counts = dict(memory.get("flow_heal_counts", {}))
+        for a in actions:
+            if a.get("decision") == "script" and a.get("healed"):
+                sig = _slug(a["flow_name"])
+                flow_heal_counts[sig] = flow_heal_counts.get(sig, 0) + 1
+
+        # cache stable specs for reuse on unchanged repeat flows (skips an LLM call on future runs)
+        flow_by_id = {f["flow_id"]: f for f in flows}
+        cached_specs = dict(memory.get("cached_specs", {}))
+        for spec in specs:
+            sig = _slug(spec["flow_name"])
+            if flow_heal_counts.get(sig, 0) >= 2:
+                continue  # chronically unstable -- always regenerate fresh instead of trusting it
+            if not spec.get("selectors") or any(v["status"] not in ("verified", "healed") for v in spec["selectors"]):
+                continue  # only cache specs whose selectors are fully verified (or a proven heal)
+            flow = flow_by_id.get(spec["flow_id"], {})
+            cached_specs[sig] = {"filename": spec["filename"], "code": spec["code"],
+                                  "selectors": [v["selector"] for v in spec["selectors"]],
+                                  "steps_hash": _stable_hash(flow.get("steps", []))}
+
+        insights = _detect_insights(flow_history, flow_heal_counts, list(recurring.values()))
+
+        run_count = memory.get("run_count", 0) + 1
+        update = {"key": key, "url": config["url"], "run_count": run_count,
+                  "last_run_id": run_id, "last_seen": now_iso(),
+                  "first_seen": memory.get("first_seen") or now_iso(),
+                  "known_selectors": known_selectors, "healed_locators": healed_locators,
+                  "recurring_defects": list(recurring.values()), "coverage_gap_areas": gap_areas,
+                  "flow_history": flow_history, "flow_names": flow_names,
+                  "flow_heal_counts": flow_heal_counts, "cached_specs": cached_specs,
+                  "insights": insights}
+        await self.db.agent_memory.update_one({"key": key}, {"$set": update}, upsert=True)
+
+        repeat_defects = [d for d in recurring.values() if d["count"] > 1]
+        msg = (f"Persisted agent memory for {key}: {len(known_selectors)} known selector(s), "
+               f"{len(healed_locators)} healed locator pattern(s) remembered")
+        if repeat_defects:
+            msg += f", {len(repeat_defects)} recurring defect(s) flagged across runs"
+        msg += f". This was run #{run_count} on this target."
+
+        readable_insights = None
+        if any(insights.values()):
+            readable_insights = {
+                "flaky_flows": [flow_names.get(sig, sig) for sig in insights["flaky_flows"]],
+                "confirmed_regressions": insights["confirmed_regressions"],
+                "unstable_selector_flows": [{"flow_name": flow_names.get(sig, sig), "heal_count": flow_heal_counts.get(sig)}
+                                            for sig in insights["unstable_selector_flows"]],
+            }
+            await self.db.reports.update_one({"run_id": run_id}, {"$set": {"insights": readable_insights}})
+            await self.db.runs.update_one({"id": run_id}, {"$set": {
+                "report_summary.insights_count": sum(len(v) for v in insights.values())}})
+        # carried on the event itself (not just written to Mongo) so a live-following frontend
+        # merges `insights` into the report it already has, instead of only seeing it after reload.
+        await self.emit(run_id, "REPORT", "memory", "success", "memory_persist", msg,
+                        {"memory_summary": {"run_count": run_count, "known_selectors": len(known_selectors),
+                                            "healed_locators": len(healed_locators),
+                                            "recurring_defects": len(recurring), "coverage_gap_areas": len(gap_areas)},
+                         "insights": readable_insights})
+
+        if readable_insights:
+            for sig in insights["flaky_flows"]:
+                await self.emit(run_id, "REPORT", "memory", "warn", "pattern_insight",
+                                f"Flaky flow detected: '{flow_names.get(sig, sig)}' has alternated between "
+                                "passing and failing across recent runs on this target.")
+            for reg in insights["confirmed_regressions"]:
+                await self.emit(run_id, "REPORT", "memory", "error", "pattern_insight",
+                                f"Confirmed regression: '{reg['flow_name']}' ({reg['fail_type']}) has now "
+                                f"failed {reg['count']} time(s) across runs on this target.")
+            for sig in insights["unstable_selector_flows"]:
+                await self.emit(run_id, "REPORT", "memory", "warn", "pattern_insight",
+                                f"Chronically unstable selectors in '{flow_names.get(sig, sig)}': healed in "
+                                f"{flow_heal_counts.get(sig)} separate runs — consider a stable data-testid.")
 
     async def _safe_llm(self, system, prompt, model, run_id, stage, agent):
         try:

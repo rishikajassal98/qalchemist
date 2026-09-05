@@ -87,6 +87,10 @@ export function deriveState(events) {
       });
     } else if (t === "report" && e.data?.report) {
       report = e.data.report;
+    } else if (t === "memory_persist" && e.data?.insights && report) {
+      // insights are computed after REPORT already emitted, so merge them into the report we
+      // already have instead of requiring a reload to see pattern insights live.
+      report = { ...report, insights: e.data.insights };
     } else if (t === "run_complete") {
       complete = true;
     }
