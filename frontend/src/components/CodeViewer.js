@@ -3,6 +3,7 @@ import { Copy, CheckCircle2, FileCode, ShieldCheck, ShieldAlert, Download, Info,
 import { toast } from "sonner";
 import { Empty } from "@/components/TestPlanView";
 import { ARTIFACT_BASE } from "@/api";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 
 const TYPE_DOT = { happy: "bg-emerald-400", edge: "bg-cyan-400", error: "bg-rose-400" };
 
@@ -77,12 +78,22 @@ export default function CodeViewer({ specs, runId, run }) {
           </button>
         </div>
         <div className="shrink-0 border-b border-slate-800/80 bg-[#0d131f] px-4 py-2 flex flex-col gap-1.5">
-          <div className="flex items-start gap-2 text-[11px] text-slate-500">
-            <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-            <span>Portable starting point for your own suite — the <b className="text-slate-400">Runner</b> tab shows the
-              actual locators, screenshots and pass/fail from the real live-browser execution, which drives its own
-              interpreter rather than this file.</span>
-          </div>
+          {/* single line, not a wrapping paragraph — at narrow widths the old full-sentence version
+              could wrap to 300px+ tall and, being shrink-0, squeeze the actual code pane below it down
+              to 0px. The full explanation still exists, just on hover instead of always on-screen. */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div className="flex items-center gap-2 text-[11px] text-slate-500 w-fit cursor-help">
+                <Info className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">Portable starting point — see <b className="text-slate-400">Runner</b> for live results</span>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="max-w-xs font-mono text-[11px]">
+              Portable starting point for your own suite — the Runner tab shows the actual locators,
+              screenshots and pass/fail from the real live-browser execution, which drives its own
+              interpreter rather than this file.
+            </TooltipContent>
+          </Tooltip>
           {spec.healed_selectors?.length > 0 && (
             <div className="flex flex-col gap-1" data-testid="spec-healed-diff">
               {spec.healed_selectors.map((h, i) => (
@@ -103,7 +114,10 @@ export default function CodeViewer({ specs, runId, run }) {
             </a>
           )}
         </div>
-        <div className="flex-1 overflow-auto">
+        {/* min-h guards against the code pane ever being squeezed to 0 by its shrink-0 siblings —
+            it's the entire point of this tab, so it should never lose a shrink fight to a banner
+            or the footer below, no matter how tall either happens to render at a given width. */}
+        <div className="flex-1 min-h-[200px] overflow-auto">
           <pre data-testid="code-content" className="p-4 font-mono text-[12px] leading-relaxed"><code dangerouslySetInnerHTML={{ __html: highlight(spec.code) }} /></pre>
         </div>
         {/* selector validation footer */}

@@ -29,6 +29,13 @@ SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
 SARVAM_API_URL = "https://api.sarvam.ai/v1/chat/completions"
 DEFAULT_MODEL = "sarvam-105b"
 
+# retried: transient — a slow/overloaded backend or a rate limit that a short backoff can plausibly
+# clear. NOT retried (4xx other than 429): a bad API key, a malformed request, etc. — retrying those
+# just burns the run's time budget on an error that will be identical the 2nd and 3rd time too.
+LLM_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+LLM_MAX_ATTEMPTS = 3
+LLM_BACKOFF_BASE_SECONDS = 1.5
+
 STAGES = ["EXPLORE", "PLAN", "EVALUATE", "GENERATE", "RUN", "HEAL", "REPORT"]
 
 AGENT_DISPLAY = {
@@ -60,42 +67,72 @@ def now_iso():
 # ----------------------------------------------------------------------------
 # LLM helper
 # ----------------------------------------------------------------------------
-async def llm_json(system: str, prompt: str, model: str = DEFAULT_MODEL, session: str = None):
-    """Call Sarvam AI's OpenAI-compatible chat completions endpoint and parse JSON out of the reply."""
+async def llm_json(system: str, prompt: str, model: str = DEFAULT_MODEL, session: str = None, on_retry=None):
+    """Call Sarvam AI's OpenAI-compatible chat completions endpoint and parse JSON out of the reply.
+
+    Retries up to LLM_MAX_ATTEMPTS times, but only on failures a retry can plausibly fix: a network
+    timeout/connect error, or a status in LLM_RETRYABLE_STATUS (rate limit / backend overload). A 4xx
+    like a bad API key is raised immediately on the first attempt — no amount of retrying changes it,
+    so retrying would only cost the run wall-clock time for an identical failure."""
     if not SARVAM_API_KEY:
         raise RuntimeError("SARVAM_API_KEY not configured")
-    async with httpx.AsyncClient(timeout=55) as client:
-        resp = await client.post(
-            SARVAM_API_URL,
-            headers={
-                "Authorization": f"Bearer {SARVAM_API_KEY}",
-                "api-subscription-key": SARVAM_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.2,
-                # Sarvam's reasoning models spend tokens on reasoning_content before writing the
-                # final answer — too low a budget truncates to an empty content field.
-                "max_tokens": 8192,
-                "reasoning_effort": "low",
-            },
-        )
-        if resp.status_code >= 400:
-            # surface Sarvam's actual error body (e.g. "No credits available.") instead of a bare
-            # HTTP status line — that's the difference between a self-diagnosable message in the
-            # Decision Stream and a cryptic one that needs a manual API call to explain.
-            try:
-                detail = resp.json().get("error", {}).get("message") or resp.text[:200]
-            except Exception:
-                detail = resp.text[:200]
-            raise RuntimeError(f"Sarvam API error {resp.status_code}: {detail}")
-        text = resp.json()["choices"][0]["message"]["content"]
-    return _extract_json(text), text
+    last_exc = None
+    for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+        try:
+            # read=70: measured against the real API, a legitimate (non-degraded) call can take
+            # 30-90s depending on how long the model's own reasoning phase runs before it starts
+            # writing the answer — this is not spare margin for network flakiness, it's the actual
+            # observed latency of a normal successful response.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=70, write=10, pool=10)) as client:
+                resp = await client.post(
+                    SARVAM_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {SARVAM_API_KEY}",
+                        "api-subscription-key": SARVAM_API_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.2,
+                        # Sarvam's reasoning models spend tokens on reasoning_content before writing the
+                        # final answer, and the reasoning phase alone varied 8k-32k+ chars run-to-run
+                        # on an identical prompt in testing — 8192 left zero room for the actual answer
+                        # on the slower runs (finish_reason: "length", content: null, every time). This
+                        # is sized to the model's own measured worst case, not a nice-to-have buffer.
+                        "max_tokens": 28672,
+                        "reasoning_effort": "low",
+                    },
+                )
+            if resp.status_code >= 400:
+                # surface Sarvam's actual error body (e.g. "No credits available.") instead of a bare
+                # HTTP status line — that's the difference between a self-diagnosable message in the
+                # Decision Stream and a cryptic one that needs a manual API call to explain.
+                try:
+                    detail = resp.json().get("error", {}).get("message") or resp.text[:200]
+                except Exception:
+                    detail = resp.text[:200]
+                err = RuntimeError(f"Sarvam API error {resp.status_code}: {detail}")
+                if resp.status_code not in LLM_RETRYABLE_STATUS or attempt == LLM_MAX_ATTEMPTS:
+                    raise err
+                last_exc = err
+            else:
+                text = resp.json()["choices"][0]["message"]["content"]
+                return _extract_json(text), text
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+            last_exc = e
+            if attempt == LLM_MAX_ATTEMPTS:
+                raise
+        if on_retry:
+            # httpx's own timeout/connect exceptions frequently stringify to "" (no message body),
+            # which would otherwise stream an opaque "failed (); retrying..." with no diagnostic value.
+            detail = str(last_exc)[:100] or type(last_exc).__name__
+            await on_retry(attempt, LLM_MAX_ATTEMPTS, detail)
+        await asyncio.sleep(LLM_BACKOFF_BASE_SECONDS * attempt)
+    raise last_exc
 
 
 def _extract_json(text: str):
@@ -159,9 +196,6 @@ class GraphState(TypedDict, total=False):
     specs: list
     executions: list
     actions: list
-    still_failing_count: int
-    heal_retried: bool
-    validate_feedback: dict
     report: dict
 
 
@@ -221,7 +255,6 @@ class Orchestrator:
         g.add_node("run_tests", self._node_run)
         g.add_node("heal", self._node_heal)
         g.add_node("validate", self._node_validate)
-        g.add_node("prepare_retry", self._node_prepare_retry)
         g.add_node("report", self._node_report)
         g.add_node("persist_memory", self._node_persist_memory)
 
@@ -246,15 +279,12 @@ class Orchestrator:
         g.add_edge("generate", "run_tests")
         g.add_edge("run_tests", "heal")
         g.add_edge("heal", "validate")
-        # conditional edge: if healing still leaves flows unresolved (an attempted heal that didn't
-        # verify, i.e. escalated to "review"), send control back to re-plan and re-run those flows
-        # once before reporting, instead of reporting on a plan/spec that's already known to be
-        # incomplete. A run that has already been through one validate-retry cycle always falls
-        # through to REPORT regardless of this second attempt's outcome (see _route_after_validate),
-        # so this can never loop more than once.
-        g.add_conditional_edges("validate", self._route_after_validate,
-                                {"retry": "prepare_retry", "report": "report"})
-        g.add_edge("prepare_retry", "plan")
+        # no automatic retry: VALIDATE is a log-only summary of what's left unresolved after HEAL's
+        # own heal-and-verify pass. A verified heal already updated the spec in place (in HEAL); a
+        # heal that didn't verify, or a genuine defect, goes to REPORT as "review"/"defect" and is a
+        # human call from there (Flag as Defect / Dismiss in the Healer tab) — not another automatic
+        # PLAN/GENERATE/RUN cycle.
+        g.add_edge("validate", "report")
         g.add_edge("report", "persist_memory")
         g.add_edge("persist_memory", END)
         return g.compile()
@@ -276,18 +306,6 @@ class Orchestrator:
         if high_gaps or evaluation.get("prd_gaps"):
             return "replan"
         return "pause_gate"
-
-    @staticmethod
-    def _route_after_validate(state: "GraphState") -> str:
-        # only one validate-retry cycle -- once this run has already looped back through PLAN/RUN
-        # once because of a heal that didn't verify (`heal_retried`), always report regardless of
-        # what this second attempt's validation finds, so a genuinely stubborn app defect can't
-        # loop the pipeline forever.
-        if state.get("heal_retried"):
-            return "report"
-        if state.get("still_failing_count", 0) > 0:
-            return "retry"
-        return "report"
 
     # ---- node wrappers: thin adapters from GraphState to the stage implementations ----
     async def _node_recall_memory(self, state: GraphState) -> dict:
@@ -314,12 +332,9 @@ class Orchestrator:
         return {"surface": surface}
 
     async def _node_plan(self, state: GraphState) -> dict:
-        # a validate-retry loop (HEAL -> VALIDATE -> here) re-enters this same node with
-        # `validate_feedback` set; the initial pass has none, so `feedback` stays None as before.
         flows = await self._stage_plan(state["run_id"], state["config"], state["surface"],
                                         self._model(state["config"], "planner"),
-                                        memory=state.get("memory") or {},
-                                        feedback=state.get("validate_feedback"))
+                                        memory=state.get("memory") or {})
         return {"flows": flows}
 
     async def _node_evaluate(self, state: GraphState) -> dict:
@@ -372,25 +387,9 @@ class Orchestrator:
         return {"actions": actions}
 
     async def _node_validate(self, state: GraphState) -> dict:
-        still_failing = await self._stage_validate(state["run_id"], state.get("actions") or [])
-        return {"still_failing_count": len(still_failing)}
-
-    async def _node_prepare_retry(self, state: GraphState) -> dict:
-        run_id, actions = state["run_id"], state.get("actions") or []
-        still_failing = [a for a in actions if a.get("decision") == "review" and not a.get("healed")]
-        names = ", ".join(sorted({a["flow_name"] for a in still_failing})) or "unknown flow(s)"
-        await self.emit(run_id, "HEAL", "meta", "warn", "decision",
-                        f"Meta-agent decision: validation after healing found {len(still_failing)} flow(s) "
-                        f"still failing ({names}) — regenerating the plan and re-running before reporting, "
-                        "instead of reporting on a spec already known to be broken. This retry happens at "
-                        "most once per run.")
-        await self._handoff(
-            run_id, "HEAL", "healer", "planner", "validation",
-            f"{len(still_failing)} flow(s) still failing after healing", level="warn")
-        feedback = {"validation_retry": True,
-                   "still_failing_flows": [{"flow_name": a["flow_name"], "fail_type": a.get("fail_type"),
-                                             "rationale": a.get("rationale")} for a in still_failing]}
-        return {"heal_retried": True, "validate_feedback": feedback}
+        # log-only: no retry follows this — see the "validate" edge in _build_graph.
+        await self._stage_validate(state["run_id"], state.get("actions") or [])
+        return {}
 
     async def _node_report(self, state: GraphState) -> dict:
         report = await self._stage_report(state["run_id"], state["config"], state["surface"],
@@ -541,12 +540,7 @@ class Orchestrator:
         memory = memory or {}
         await self.set_stage(run_id, "PLAN", "running")
         label = "re-planning" if feedback else "synthesizing"
-        if feedback and feedback.get("validation_retry"):
-            feedback_note = " after validation found flows still failing post-heal"
-        elif feedback:
-            feedback_note = " with evaluator feedback"
-        else:
-            feedback_note = ""
+        feedback_note = " with evaluator feedback" if feedback else ""
         await self.emit(run_id, "PLAN", "planner", "info", "stage_start",
                         f"Planner ({model}) {label} user-flow test plan{feedback_note}...")
         system = ("You are an expert QA test planner. Given a web app's discovered surface, produce meaningful "
@@ -565,11 +559,7 @@ class Orchestrator:
                       f"{json.dumps([{'flow': d.get('flow_name'), 'fail_type': d.get('fail_type'), 'seen': d.get('count')} for d in recurring]) if recurring else 'none'}\n"
                       f"- Persistent coverage gap areas: {json.dumps(gap_areas) if gap_areas else 'none'}\n"
                       "Prioritize flows that re-test these known trouble spots.\n\n")
-        if feedback and feedback.get("validation_retry"):
-            prompt += (f"VALIDATION AFTER HEALING FOUND FLOWS STILL FAILING — the new plan MUST address "
-                       f"them explicitly (different steps/selectors, not a repeat of the same approach):\n"
-                       f"{json.dumps(feedback)[:1500]}\n\n")
-        elif feedback:
+        if feedback:
             prompt += (f"A PLAN EVALUATOR AUDITED YOUR PREVIOUS PLAN AND FOUND THESE GAPS — the new plan MUST "
                        f"address them explicitly:\n{json.dumps(feedback)[:1500]}\n\n")
         prompt += "Produce the test plan JSON."
@@ -1241,8 +1231,15 @@ class Orchestrator:
                                 f"{flow_heal_counts.get(sig)} separate runs — consider a stable data-testid.")
 
     async def _safe_llm(self, system, prompt, model, run_id, stage, agent):
+        async def on_retry(attempt, max_attempts, detail):
+            await self.emit(run_id, stage, agent, "warn", "log",
+                            f"Sarvam call attempt {attempt}/{max_attempts} failed ({detail}); retrying...")
+
         try:
-            data, text = await asyncio.wait_for(llm_json(system, prompt, model, session=run_id), timeout=75)
+            # 3 attempts x up to 70s read timeout + backoff (1.5s, 3s) can approach ~215s worst case;
+            # give this call room for all of that instead of cutting retries off mid-backoff.
+            data, text = await asyncio.wait_for(
+                llm_json(system, prompt, model, session=run_id, on_retry=on_retry), timeout=220)
             if data is None:
                 snippet = (text or "").strip()[:120] or "empty response"
                 await self.emit(run_id, stage, agent, "warn", "log",

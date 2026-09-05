@@ -23,14 +23,14 @@ is expressed as real, typed graph edges rather than inline `if`s:
   skips straight to `EXPLORE`.
 - **Re-plan loop** — if the Evaluator finds a high-severity coverage gap or an unmet PRD requirement, the
   graph escalates back to the Planner with that feedback for one re-planning pass before generation
-  proceeds.
-- **Validate-retry loop** — if a heal is attempted but doesn't verify on live replay, `VALIDATE` sends the
-  pipeline back through `PLAN → RUN` once more (with the still-failing flows as feedback) instead of
-  reporting on a spec already known to be broken.
+  proceeds. Capped at one cycle (tracked in graph state via `replanned`), so a genuinely incomplete plan
+  can't loop the pipeline forever.
 
-Both retry loops are capped at exactly one cycle (tracked in graph state), so a genuinely broken target
-can't loop the pipeline forever — see [Architecture](#architecture) and
-[Memory & cross-run learning](#memory--cross-run-learning) below.
+HEAL itself already includes its own heal-and-verify step — a proposed fix is live-replayed immediately,
+and only reported as `healed` if that replay actually passes. `VALIDATE`, after HEAL, doesn't retry: it's
+a log-only summary of whatever's left unresolved (a heal that didn't verify, or a genuine app defect).
+Those go to REPORT as `review`/`defect` and become a human call from there — Flag as Defect or Dismiss in
+the Healer tab — rather than another automatic PLAN/GENERATE/RUN cycle.
 
 **Stack:** React + Tailwind + shadcn/ui · FastAPI (async) · LangGraph · MongoDB · Playwright (Chromium) · Sarvam AI (sarvam-105b)
 
@@ -55,8 +55,7 @@ flowchart TD
         GEN["GENERATE<br/>Playwright specs, live selector<br/>validation, cached-spec reuse"] --> RUN
         RUN["RUN<br/>real parallel Chromium<br/>execution"] --> HEAL
         HEAL["HEAL<br/>heuristic + LLM classify script<br/>vs. defect, fix verified by live<br/>replay, known fixes reused"] --> VALIDATE
-        VALIDATE["VALIDATE<br/>still-failing check"] -->|"unresolved:<br/>re-plan decision"| PLAN
-        VALIDATE -->|"resolved"| REPORT
+        VALIDATE["VALIDATE<br/>log-only summary of<br/>what's still unresolved"] --> REPORT
         REPORT["REPORT<br/>test-quality report"] --> PERSIST
         PERSIST["PERSIST MEMORY<br/>update agent_memory +<br/>pattern insights"]
     end
@@ -70,9 +69,9 @@ Every stage streams its decisions live over SSE to the frontend's Decision Strea
 real discovered surface (not a fixed generic template) so the pipeline never silently stalls or produces
 misleading output — see `_fallback_flows` / `_fallback_evaluation` in `orchestrator.py`.
 
-Both retry edges (`EVALUATE → PLAN` and `VALIDATE → PLAN`) are one-shot: each is gated by a flag carried
-in the graph's typed state (`replanned`, `heal_retried`) that the router checks before allowing another
-loop, so a second pass through either edge always falls through instead of looping again.
+The `EVALUATE → PLAN` re-plan edge is one-shot: it's gated by a `replanned` flag carried in the graph's
+typed state that the router checks before allowing another loop, so a second audit always falls through
+to the pause gate instead of looping again.
 
 ---
 
@@ -244,9 +243,9 @@ App opens at **http://localhost:3000**.
 - **Artifacts** (screenshots, video, Playwright trace) are real files written to
   `backend/run_artifacts/<run_id>/` and served at `/artifacts/...`; linked from the Runner tab.
 - **Orchestration is a LangGraph `StateGraph`** (`orchestrator.py: Orchestrator._build_graph`), not a
-  hand-rolled sequence of `await`s — every stage is a graph node, and both retry loops (re-plan,
-  validate-retry) plus the memory-driven learning branch are real conditional edges. `langgraph` is
-  already pinned in `requirements.txt`; no extra install step.
+  hand-rolled sequence of `await`s — every stage is a graph node, and the re-plan loop plus the
+  memory-driven learning branch are real conditional edges. `langgraph` is already pinned in
+  `requirements.txt`; no extra install step.
 - **Cross-run memory** needs no extra setup — `agent_memory` is just another collection in the same
   Mongo database (`DB_NAME` from `.env`), keyed by normalized target URL, read before EXPLORE and
   written after REPORT. See [Memory & cross-run learning](#memory--cross-run-learning) above.
