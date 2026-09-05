@@ -357,7 +357,8 @@ def _locator_from_string(page, sel: str):
 
 
 _STOPWORDS = re.compile(
-    r"^(click|select|choose|tap|press|open|add|the|on|to|a|an|and|then|assert|verify|check|that|is|are)\s+",
+    r"^(click|select|choose|tap|press|open|add|proceed|continue|submit|confirm|"
+    r"the|on|to|a|an|and|then|assert|verify|check|that|is|are)\s+",
     re.I)
 
 
@@ -374,7 +375,7 @@ def _keywords(step_text: str) -> str:
         lit = m.group(1) if m.group(1) is not None else m.group(2)
         if lit and lit.strip():
             return lit.strip()
-    t = re.sub(r"\b(button|link|icon|option|tab|element|page|field)\b", "", step_text, flags=re.I)
+    t = re.sub(r"\b(button|link|icon|option|tab|element|page|field|item|product)\b", "", step_text, flags=re.I)
     prev = None
     while prev != t:
         prev = t
@@ -567,7 +568,7 @@ async def _execute_step(page, step_text, spec_selectors, base_url, prev_url, use
                     filled_any = True
                 except Exception:
                     continue
-            loc, desc = await _find_clickable(page, "login submit button", spec_selectors)
+            loc, desc, _tried = await _find_clickable(page, "login submit button", spec_selectors)
             if loc is None:
                 desc = 'button[type="submit"], input[type="submit"]'
                 try:
@@ -595,7 +596,7 @@ async def _execute_step(page, step_text, spec_selectors, base_url, prev_url, use
             return {"ok": True, "locator": ", ".join(dict.fromkeys(filled))}
 
         if any(k in t for k in ("submit", "proceed", "continue", "checkout", "confirm")):
-            loc, desc = await _find_clickable(page, step_text, spec_selectors)
+            loc, desc, _tried = await _find_clickable(page, step_text, spec_selectors)
             if loc is None:
                 desc = 'button[type="submit"], input[type="submit"]'
                 await page.locator(desc).first.click(timeout=5000)
@@ -607,7 +608,7 @@ async def _execute_step(page, step_text, spec_selectors, base_url, prev_url, use
                 pass
             return {"ok": True, "locator": desc}
 
-        if any(k in t for k in ("click", "select", "choose", "tap", "press", "add")):
+        if any(k in t for k in ("click", "select", "choose", "tap", "press", "add", "open")):
             loc, desc, tried = await _find_clickable(page, step_text, spec_selectors)
             if loc is None:
                 kw = _keywords(step_text)
@@ -739,7 +740,13 @@ async def run_flow_pw(run_id, browser, storage_state_path, config, flow, spec, o
     for i, step_text in enumerate(flow.get("steps") or ["Navigate to base URL"]):
         result = {"ok": True}
         if not failed:
-            result = await _execute_step(page, step_text, [s["selector"] for s in spec.get("selectors", [])],
+            # per-step candidates from EXPLORE's action-chain walk take priority over the flow-wide
+            # pool for whichever steps have one — a persistent nav element like an icon-only cart
+            # link is visible on every page and would otherwise win the flow-wide pool for every
+            # later step too (see _action_chain_flow_steps' docstring in orchestrator.py).
+            per_step = step_selectors[i] if step_selectors and i < len(step_selectors) else None
+            selectors_for_step = per_step if per_step else flow_wide_selectors
+            result = await _execute_step(page, step_text, selectors_for_step,
                                           config["url"], prev_url,
                                           username=config.get("username"), password=config.get("password"))
             prev_url = page.url

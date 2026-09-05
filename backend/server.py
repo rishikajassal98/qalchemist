@@ -69,6 +69,7 @@ class RunConfig(BaseModel):
     intent: Optional[str] = None
     budget: Optional[str] = "standard"
     workers: int = 3
+    headed: bool = False
     pause_after_plan: bool = False
     models: Dict[str, str] = Field(default_factory=dict)
     preset: Optional[str] = None
