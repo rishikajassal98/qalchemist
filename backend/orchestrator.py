@@ -1,4 +1,13 @@
-"""QAlchemist meta-agent orchestrator: EXPLORE -> PLAN -> EVALUATE -> GENERATE -> RUN -> HEAL -> REPORT."""
+"""QAlchemist meta-agent orchestrator: EXPLORE -> PLAN -> EVALUATE -> GENERATE -> RUN -> HEAL -> REPORT.
+
+The pipeline is wired as a LangGraph StateGraph: each stage is a node reading/writing a shared typed
+state, and branching -- the evaluator's re-plan feedback loop, the plan-approval pause gate, and
+whether a target has been seen before -- is expressed as graph edges instead of inline control flow.
+A per-target agent-memory document (recalled before EXPLORE, persisted after REPORT, keyed by
+normalized URL) lets a returning run learn from every prior run against that same target: known-good
+selectors, previously healed locators, recurring defects that graduate into confirmed regressions,
+and stable specs that can be reused without a fresh LLM call.
+"""
 import os
 import re
 import json
@@ -6,10 +15,12 @@ import uuid
 import hashlib
 import asyncio
 from datetime import datetime, timezone
+from typing import TypedDict
 from urllib.parse import urlparse
 
 import httpx
 from playwright.async_api import async_playwright
+from langgraph.graph import StateGraph, START, END
 
 from event_bus import bus
 import pw_engine
@@ -30,6 +41,7 @@ AGENT_DISPLAY = {
     "healer": "Healer",
     "reporter": "Reporter",
     "operator": "Operator",
+    "memory": "Agent Memory",
 }
 
 
@@ -134,10 +146,25 @@ def surface_summary(surface: dict) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Agent memory (cross-run learning, keyed per target URL)
+# LangGraph state & agent-memory helpers
 # ----------------------------------------------------------------------------
+class GraphState(TypedDict, total=False):
+    run_id: str
+    config: dict
+    memory: dict
+    surface: dict
+    flows: list
+    evaluation: dict
+    replanned: bool
+    specs: list
+    executions: list
+    actions: list
+    report: dict
+
+
 def _memory_key(url: str) -> str:
-    """Normalize a target URL into a stable agent-memory key (host + path, no query/fragment)."""
+    """Normalize a target URL into a stable agent-memory key (host + path, no query/fragment) so
+    the same target is recognized run-over-run regardless of incidental query-string differences."""
     p = urlparse(url)
     return f"{p.netloc.lower()}{p.path.rstrip('/')}" or url
 
@@ -172,6 +199,159 @@ def _detect_insights(flow_history: dict, flow_heal_counts: dict, recurring_defec
 class Orchestrator:
     def __init__(self, db):
         self.db = db
+        self.graph = self._build_graph()
+
+    def _model(self, config, agent):
+        return (config.get("models") or {}).get(agent, DEFAULT_MODEL)
+
+    # ---- LangGraph wiring ----
+    def _build_graph(self):
+        g = StateGraph(GraphState)
+        g.add_node("recall_memory", self._node_recall_memory)
+        g.add_node("apply_learning", self._node_apply_learning)
+        g.add_node("explore", self._node_explore)
+        g.add_node("plan", self._node_plan)
+        g.add_node("evaluate", self._node_evaluate)
+        g.add_node("replan", self._node_replan)
+        g.add_node("pause_gate", self._node_pause_gate)
+        g.add_node("generate", self._node_generate)
+        g.add_node("run_tests", self._node_run)
+        g.add_node("heal", self._node_heal)
+        g.add_node("report", self._node_report)
+        g.add_node("persist_memory", self._node_persist_memory)
+
+        g.add_edge(START, "recall_memory")
+        # conditional edge: a target this URL has run against before takes the "apply_learning"
+        # branch (surfacing what was learned before EXPLORE even starts) instead of the cold-start
+        # path a genuinely new target takes -- this is the graph-level expression of "if the URL
+        # comes again, pick up the learning".
+        g.add_conditional_edges("recall_memory", self._route_after_recall,
+                                {"returning_target": "apply_learning", "new_target": "explore"})
+        g.add_edge("apply_learning", "explore")
+        g.add_edge("explore", "plan")
+        g.add_edge("plan", "evaluate")
+        # conditional edge: only a real coverage/PRD gap sends control back to the Planner; a clean
+        # audit goes straight to the pause gate. A run that has already been through one replan
+        # cycle always falls through to the pause gate (see _route_after_evaluate) so this can never
+        # loop more than once.
+        g.add_conditional_edges("evaluate", self._route_after_evaluate,
+                                {"replan": "replan", "pause_gate": "pause_gate"})
+        g.add_edge("replan", "evaluate")
+        g.add_edge("pause_gate", "generate")
+        g.add_edge("generate", "run_tests")
+        g.add_edge("run_tests", "heal")
+        g.add_edge("heal", "report")
+        g.add_edge("report", "persist_memory")
+        g.add_edge("persist_memory", END)
+        return g.compile()
+
+    @staticmethod
+    def _route_after_recall(state: "GraphState") -> str:
+        memory = state.get("memory") or {}
+        return "returning_target" if memory.get("run_count", 0) > 0 else "new_target"
+
+    @staticmethod
+    def _route_after_evaluate(state: "GraphState") -> str:
+        # only one replan cycle -- once the evaluator's feedback has already been fed back to the
+        # Planner (`replanned`), always proceed to the pause gate regardless of what the second
+        # audit finds, matching the original single-retry meta-agent decision.
+        if state.get("replanned"):
+            return "pause_gate"
+        evaluation = state.get("evaluation") or {}
+        high_gaps = [g for g in evaluation.get("coverage_gaps", []) if str(g.get("severity", "")).lower() == "high"]
+        if high_gaps or evaluation.get("prd_gaps"):
+            return "replan"
+        return "pause_gate"
+
+    # ---- node wrappers: thin adapters from GraphState to the stage implementations ----
+    async def _node_recall_memory(self, state: GraphState) -> dict:
+        memory = await self._stage_recall_memory(state["run_id"], state["config"])
+        return {"memory": memory}
+
+    async def _node_apply_learning(self, state: GraphState) -> dict:
+        run_id, memory = state["run_id"], state.get("memory") or {}
+        insights = memory.get("insights") or {}
+        flaky = insights.get("flaky_flows") or []
+        regressions = insights.get("confirmed_regressions") or []
+        unstable = insights.get("unstable_selector_flows") or []
+        await self.emit(run_id, "EXPLORE", "meta", "info", "decision",
+                        f"Meta-agent decision: recognized a returning target (this will be run "
+                        f"#{memory.get('run_count', 0) + 1} on this URL) — applying learned patterns "
+                        f"instead of starting cold: {len(memory.get('known_selectors', []))} known "
+                        f"selector(s), {len(memory.get('healed_locators', {}))} previously healed "
+                        f"locator(s), {len(flaky)} flaky flow(s), {len(regressions)} confirmed "
+                        f"regression(s), {len(unstable)} chronically unstable selector flow(s) tracked.")
+        return {}
+
+    async def _node_explore(self, state: GraphState) -> dict:
+        surface = await self._stage_explore(state["run_id"], state["config"])
+        return {"surface": surface}
+
+    async def _node_plan(self, state: GraphState) -> dict:
+        flows = await self._stage_plan(state["run_id"], state["config"], state["surface"],
+                                        self._model(state["config"], "planner"),
+                                        memory=state.get("memory") or {})
+        return {"flows": flows}
+
+    async def _node_evaluate(self, state: GraphState) -> dict:
+        flows, evaluation = await self._stage_evaluate(
+            state["run_id"], state["config"], state["surface"], state["flows"],
+            self._model(state["config"], "evaluator"), memory=state.get("memory") or {},
+            second_pass=state.get("replanned", False))
+        return {"flows": flows, "evaluation": evaluation}
+
+    async def _node_replan(self, state: GraphState) -> dict:
+        run_id, config, evaluation = state["run_id"], state["config"], state["evaluation"]
+        # meta-agent decision: a real audit finding found serious gaps -> re-invoke the Planner
+        # once with that feedback before locking the plan, rather than generating tests for a plan
+        # the evaluator itself flagged as incomplete.
+        high_gaps = [g for g in evaluation.get("coverage_gaps", []) if str(g.get("severity", "")).lower() == "high"]
+        n_prd = len(evaluation.get("prd_gaps") or [])
+        await self.emit(run_id, "EVALUATE", "meta", "warn", "decision",
+                        f"Meta-agent decision: {len(high_gaps)} high-severity coverage gap(s) and "
+                        f"{n_prd} PRD gap(s) found — escalating back to the "
+                        "Planner with this feedback before generation, instead of proceeding on an "
+                        "incomplete plan.")
+        await self._handoff(
+            run_id, "EVALUATE", "evaluator", "planner", "feedback",
+            f"{len(high_gaps)} high-severity coverage gap(s), {n_prd} PRD gap(s)",
+            level="warn")
+        flows = await self._stage_plan(run_id, config, state["surface"],
+                                        self._model(config, "planner"),
+                                        memory=state.get("memory") or {}, feedback=evaluation)
+        return {"flows": flows, "replanned": True}
+
+    async def _node_pause_gate(self, state: GraphState) -> dict:
+        await self._stage_pause_gate(state["run_id"], state["config"], state["evaluation"])
+        return {}
+
+    async def _node_generate(self, state: GraphState) -> dict:
+        specs = await self._stage_generate(state["run_id"], state["config"], state["surface"],
+                                            state["flows"], self._model(state["config"], "generator"),
+                                            memory=state.get("memory") or {})
+        return {"specs": specs}
+
+    async def _node_run(self, state: GraphState) -> dict:
+        executions = await self._stage_run(state["run_id"], state["config"], state["surface"], state["specs"])
+        return {"executions": executions}
+
+    async def _node_heal(self, state: GraphState) -> dict:
+        actions = await self._stage_heal(state["run_id"], state["config"], state["surface"],
+                                          state["executions"], state["specs"],
+                                          self._model(state["config"], "healer"),
+                                          memory=state.get("memory") or {})
+        return {"actions": actions}
+
+    async def _node_report(self, state: GraphState) -> dict:
+        report = await self._stage_report(state["run_id"], state["config"], state["surface"],
+                                           state["flows"], state["specs"], state["executions"],
+                                           state["actions"])
+        return {"report": report}
+
+    async def _node_persist_memory(self, state: GraphState) -> dict:
+        await self._stage_persist_memory(state["run_id"], state["config"], state.get("memory") or {},
+                                          state["flows"], state["specs"], state["actions"])
+        return {}
 
     def _seq(self, run_id):
         n = defaultdict_seq.get(run_id, 0) + 1
@@ -204,6 +384,36 @@ class Orchestrator:
             {"from": frm, "to": to, "artifact": artifact, "summary": summary},
         )
 
+    async def run(self, run_id: str, config: dict):
+        _resume_events[run_id] = asyncio.Event()
+        try:
+            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "running", "started_at": now_iso()}})
+            await self.emit(run_id, "EXPLORE", "meta", "info", "run_start",
+                            f"Meta-agent initialized. Target: {config['url']}",
+                            {"config": {k: config.get(k) for k in ["url", "login_url", "intent", "budget", "auth_mode"]}})
+
+            initial_state: GraphState = {"run_id": run_id, "config": config}
+            await self.graph.ainvoke(initial_state, {"recursion_limit": 50})
+
+            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "completed", "finished_at": now_iso()}})
+            await self.emit(run_id, "REPORT", "meta", "success", "run_complete",
+                            "Autonomous run complete. Report generated.")
+        except asyncio.CancelledError:
+            await self.db.runs.update_one({"id": run_id}, {"$set": {
+                "status": "aborted", "error": "aborted by operator", "finished_at": now_iso()}})
+            try:
+                await self.emit(run_id, "REPORT", "meta", "warn", "run_complete",
+                                "Run aborted by operator.")
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "failed", "error": str(e)}})
+            await self.emit(run_id, "REPORT", "meta", "error", "run_complete", f"Run failed: {e}")
+        finally:
+            _resume_events.pop(run_id, None)
+            defaultdict_seq.pop(run_id, None)
+
     # ---- MEMORY (recall) ----
     async def _stage_recall_memory(self, run_id, config):
         key = _memory_key(config["url"])
@@ -224,91 +434,8 @@ class Orchestrator:
         await self.emit(run_id, "EXPLORE", "memory", "info", "memory_recall",
                         f"No prior memory for {key} — first run on this target.")
         return {"key": key, "run_count": 0, "known_selectors": [], "healed_locators": {},
-                "recurring_defects": [], "coverage_gap_areas": {}}
-
-    async def run(self, run_id: str, config: dict):
-        _resume_events[run_id] = asyncio.Event()
-        models = config.get("models", {})
-
-        def m(agent):
-            return models.get(agent, DEFAULT_MODEL)
-
-        try:
-            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "running", "started_at": now_iso()}})
-            await self.emit(run_id, "EXPLORE", "meta", "info", "run_start",
-                            f"Meta-agent initialized. Target: {config['url']}",
-                            {"config": {k: config.get(k) for k in ["url", "login_url", "intent", "budget", "auth_mode"]}})
-
-            memory = await self._stage_recall_memory(run_id, config)
-            surface = await self._stage_explore(run_id, config)
-            plan = await self._stage_plan(run_id, config, surface, m("planner"), memory=memory)
-            plan, evaluation = await self._stage_evaluate(run_id, config, surface, plan, m("evaluator"), memory=memory)
-
-            # meta-agent decision: a real audit finding found serious gaps -> re-invoke the Planner
-            # once with that feedback before locking the plan, rather than generating tests for a
-            # plan the evaluator itself flagged as incomplete.
-            high_gaps = [g for g in evaluation.get("coverage_gaps", []) if str(g.get("severity", "")).lower() == "high"]
-            if high_gaps or evaluation.get("prd_gaps"):
-                n_prd = len(evaluation.get("prd_gaps") or [])
-                await self.emit(run_id, "EVALUATE", "meta", "warn", "decision",
-                                f"Meta-agent decision: {len(high_gaps)} high-severity coverage gap(s) and "
-                                f"{n_prd} PRD gap(s) found — escalating back to the "
-                                "Planner with this feedback before generation, instead of proceeding on an "
-                                "incomplete plan.")
-                await self._handoff(
-                    run_id, "EVALUATE", "evaluator", "planner", "feedback",
-                    f"{len(high_gaps)} high-severity coverage gap(s), {n_prd} PRD gap(s)",
-                    level="warn")
-                plan = await self._stage_plan(run_id, config, surface, m("planner"), feedback=evaluation, memory=memory)
-                plan, evaluation = await self._stage_evaluate(run_id, config, surface, plan, m("evaluator"), second_pass=True, memory=memory)
-
-            # optional pause gate
-            if config.get("pause_after_plan"):
-                await self.set_stage(run_id, "EVALUATE", "awaiting")
-                await self.emit(run_id, "EVALUATE", "meta", "warn", "awaiting_approval",
-                                "Paused for plan approval. Awaiting operator resume.")
-                await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "paused"}})
-                try:
-                    await asyncio.wait_for(_resume_events[run_id].wait(), timeout=300)
-                    await self.emit(run_id, "EVALUATE", "meta", "success", "resumed",
-                                    "Plan approved by operator. Resuming pipeline.")
-                except asyncio.TimeoutError:
-                    await self.emit(run_id, "EVALUATE", "meta", "info", "resumed",
-                                    "Approval timeout reached, auto-proceeding.")
-                await self.set_stage(run_id, "EVALUATE", "done")
-                await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "running"}})
-
-            n_gaps = len(evaluation.get("coverage_gaps") or [])
-            n_added = len(evaluation.get("added_flows") or [])
-            eval_fb = " (fallback)" if evaluation.get("_fallback") else ""
-            await self._handoff(
-                run_id, "EVALUATE", "evaluator", "generator", "evaluation",
-                f"{n_gaps} gaps, {n_added} flows auto-added{eval_fb}")
-
-            specs = await self._stage_generate(run_id, config, surface, plan, m("generator"), memory=memory)
-            executions = await self._stage_run(run_id, config, surface, specs)
-            healer = await self._stage_heal(run_id, config, surface, executions, specs, m("healer"), memory=memory)
-            await self._stage_report(run_id, config, surface, plan, specs, executions, healer)
-            await self._stage_persist_memory(run_id, config, memory, plan, specs, healer)
-
-            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "completed", "finished_at": now_iso()}})
-            await self.emit(run_id, "REPORT", "meta", "success", "run_complete",
-                            "Autonomous run complete. Report generated.")
-        except asyncio.CancelledError:
-            await self.db.runs.update_one({"id": run_id}, {"$set": {
-                "status": "aborted", "error": "aborted by operator", "finished_at": now_iso()}})
-            try:
-                await self.emit(run_id, "REPORT", "meta", "warn", "run_complete",
-                                "Run aborted by operator.")
-            except Exception:
-                pass
-            raise
-        except Exception as e:
-            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "failed", "error": str(e)}})
-            await self.emit(run_id, "REPORT", "meta", "error", "run_complete", f"Run failed: {e}")
-        finally:
-            _resume_events.pop(run_id, None)
-            defaultdict_seq.pop(run_id, None)
+                "recurring_defects": [], "coverage_gap_areas": {}, "flow_history": {},
+                "flow_names": {}, "flow_heal_counts": {}, "cached_specs": {}, "insights": {}}
 
     # ---- EXPLORE ----
     async def _stage_explore(self, run_id, config):
@@ -360,7 +487,7 @@ class Orchestrator:
         return surface
 
     # ---- PLAN ----
-    async def _stage_plan(self, run_id, config, surface, model, feedback=None, memory=None):
+    async def _stage_plan(self, run_id, config, surface, model, memory=None, feedback=None):
         memory = memory or {}
         await self.set_stage(run_id, "PLAN", "running")
         label = "re-planning" if feedback else "synthesizing"
@@ -379,10 +506,10 @@ class Orchestrator:
             recurring = memory.get("recurring_defects", [])
             gap_areas = memory.get("coverage_gap_areas", {})
             prompt += (f"MEMORY FROM {memory['run_count']} PRIOR RUN(S) ON THIS TARGET:\n"
-                       f"- Recurring defects: "
-                       f"{json.dumps([{'flow': d.get('flow_name'), 'fail_type': d.get('fail_type'), 'seen': d.get('count')} for d in recurring]) if recurring else 'none'}\n"
-                       f"- Persistent coverage gap areas: {json.dumps(gap_areas) if gap_areas else 'none'}\n"
-                       "Prioritize flows that re-test these known trouble spots.\n\n")
+                      f"- Recurring defects: "
+                      f"{json.dumps([{'flow': d.get('flow_name'), 'fail_type': d.get('fail_type'), 'seen': d.get('count')} for d in recurring]) if recurring else 'none'}\n"
+                      f"- Persistent coverage gap areas: {json.dumps(gap_areas) if gap_areas else 'none'}\n"
+                      "Prioritize flows that re-test these known trouble spots.\n\n")
         if feedback:
             prompt += (f"A PLAN EVALUATOR AUDITED YOUR PREVIOUS PLAN AND FOUND THESE GAPS — the new plan MUST "
                        f"address them explicitly:\n{json.dumps(feedback)[:1500]}\n\n")
@@ -413,7 +540,7 @@ class Orchestrator:
         return flows
 
     # ---- EVALUATE ----
-    async def _stage_evaluate(self, run_id, config, surface, flows, model, second_pass=False, memory=None):
+    async def _stage_evaluate(self, run_id, config, surface, flows, model, memory=None, second_pass=False):
         memory = memory or {}
         await self.set_stage(run_id, "EVALUATE", "running")
         await self.emit(run_id, "EVALUATE", "evaluator", "info", "stage_start",
@@ -494,6 +621,30 @@ class Orchestrator:
         await self.set_stage(run_id, "EVALUATE", "done")
         return flows, data
 
+    # ---- PAUSE GATE ----
+    async def _stage_pause_gate(self, run_id, config, evaluation):
+        if config.get("pause_after_plan"):
+            await self.set_stage(run_id, "EVALUATE", "awaiting")
+            await self.emit(run_id, "EVALUATE", "meta", "warn", "awaiting_approval",
+                            "Paused for plan approval. Awaiting operator resume.")
+            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "paused"}})
+            try:
+                await asyncio.wait_for(_resume_events[run_id].wait(), timeout=300)
+                await self.emit(run_id, "EVALUATE", "meta", "success", "resumed",
+                                "Plan approved by operator. Resuming pipeline.")
+            except asyncio.TimeoutError:
+                await self.emit(run_id, "EVALUATE", "meta", "info", "resumed",
+                                "Approval timeout reached, auto-proceeding.")
+            await self.set_stage(run_id, "EVALUATE", "done")
+            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "running"}})
+
+        n_gaps = len(evaluation.get("coverage_gaps") or [])
+        n_added = len(evaluation.get("added_flows") or [])
+        eval_fb = " (fallback)" if evaluation.get("_fallback") else ""
+        await self._handoff(
+            run_id, "EVALUATE", "evaluator", "generator", "evaluation",
+            f"{n_gaps} gaps, {n_added} flows auto-added{eval_fb}")
+
     # ---- GENERATE ----
     async def _stage_generate(self, run_id, config, surface, flows, model, memory=None):
         memory = memory or {}
@@ -564,7 +715,7 @@ class Orchestrator:
                 # per-step candidates verified during EXPLORE's action-chain walk (see
                 # _action_chain_flow_steps) — takes priority over the flow-wide `selectors` pool
                 # above for whichever steps have one, since some targets (an icon-only cart link with
-                # no visible text) can only ever be found this way, not by matching step wording.
+                # no visible text) can never be found this way, not by matching step wording.
                 spec["step_selectors"] = f["step_selectors"]
             specs.append(spec)
             await self.db.test_specs.insert_one(dict(spec))
@@ -906,14 +1057,14 @@ class Orchestrator:
         known_selectors = list(memory.get("known_selectors", []))
         for spec in specs:
             for v in spec.get("selectors", []):
-                if v.get("status") in ("verified", "healed") and v["selector"] not in known_selectors:
+                if v.get("status") == "verified" and v["selector"] not in known_selectors:
                     known_selectors.append(v["selector"])
         known_selectors = known_selectors[-50:]
 
         healed_locators = dict(memory.get("healed_locators", {}))
         for a in actions:
             heal = a.get("heal") or {}
-            if a.get("decision") == "script" and a.get("healed") and heal.get("old_selector") and heal.get("new_selector"):
+            if a.get("decision") == "script" and heal.get("old_selector") and heal.get("new_selector"):
                 healed_locators[heal["old_selector"]] = heal["new_selector"]
 
         recurring = {d["signature"]: dict(d) for d in memory.get("recurring_defects", [])}
@@ -945,7 +1096,7 @@ class Orchestrator:
             flow_history[sig] = (flow_history.get(sig, []) + [ex["final_status"]])[-10:]
         flow_heal_counts = dict(memory.get("flow_heal_counts", {}))
         for a in actions:
-            if a.get("decision") == "script" and a.get("healed"):
+            if a.get("decision") == "script":
                 sig = _slug(a["flow_name"])
                 flow_heal_counts[sig] = flow_heal_counts.get(sig, 0) + 1
 
@@ -956,8 +1107,8 @@ class Orchestrator:
             sig = _slug(spec["flow_name"])
             if flow_heal_counts.get(sig, 0) >= 2:
                 continue  # chronically unstable -- always regenerate fresh instead of trusting it
-            if not spec.get("selectors") or any(v["status"] not in ("verified", "healed") for v in spec["selectors"]):
-                continue  # only cache specs whose selectors are fully verified (or a proven heal)
+            if not spec.get("selectors") or any(v["status"] != "verified" for v in spec["selectors"]):
+                continue  # only cache specs whose selectors are fully verified
             flow = flow_by_id.get(spec["flow_id"], {})
             cached_specs[sig] = {"filename": spec["filename"], "code": spec["code"],
                                   "selectors": [v["selector"] for v in spec["selectors"]],
@@ -982,8 +1133,11 @@ class Orchestrator:
         if repeat_defects:
             msg += f", {len(repeat_defects)} recurring defect(s) flagged across runs"
         msg += f". This was run #{run_count} on this target."
+        await self.emit(run_id, "REPORT", "memory", "success", "memory_persist", msg,
+                        {"memory_summary": {"run_count": run_count, "known_selectors": len(known_selectors),
+                                            "healed_locators": len(healed_locators),
+                                            "recurring_defects": len(recurring), "coverage_gap_areas": len(gap_areas)}})
 
-        readable_insights = None
         if any(insights.values()):
             readable_insights = {
                 "flaky_flows": [flow_names.get(sig, sig) for sig in insights["flaky_flows"]],
@@ -994,15 +1148,6 @@ class Orchestrator:
             await self.db.reports.update_one({"run_id": run_id}, {"$set": {"insights": readable_insights}})
             await self.db.runs.update_one({"id": run_id}, {"$set": {
                 "report_summary.insights_count": sum(len(v) for v in insights.values())}})
-        # carried on the event itself (not just written to Mongo) so a live-following frontend
-        # merges `insights` into the report it already has, instead of only seeing it after reload.
-        await self.emit(run_id, "REPORT", "memory", "success", "memory_persist", msg,
-                        {"memory_summary": {"run_count": run_count, "known_selectors": len(known_selectors),
-                                            "healed_locators": len(healed_locators),
-                                            "recurring_defects": len(recurring), "coverage_gap_areas": len(gap_areas)},
-                         "insights": readable_insights})
-
-        if readable_insights:
             for sig in insights["flaky_flows"]:
                 await self.emit(run_id, "REPORT", "memory", "warn", "pattern_insight",
                                 f"Flaky flow detected: '{flow_names.get(sig, sig)}' has alternated between "
@@ -1174,10 +1319,11 @@ def _fallback_flows(surface):
     forms = surface.get("forms", [])
     action_pages = [p for p in pages if p.get("discovered_via") == "action_chain"]
     home_title = (pages[0].get("title") if pages else "") or ""
+    title_suffix = f' ("{home_title}")' if home_title else ""
     flows = [
         {"flow_id": "F1", "name": "Homepage loads and primary nav renders", "type": "happy", "priority": "high",
          "steps": ["Navigate to base URL", "Assert page title visible", "Assert primary nav links present"],
-         "expected_outcome": f"Landing page{f' (\"{home_title}\")' if home_title else ''} renders with navigation",
+         "expected_outcome": f"Landing page{title_suffix} renders with navigation",
          "selectors": ["getByRole('navigation')"]},
     ]
 
