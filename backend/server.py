@@ -309,8 +309,10 @@ async def export_report(run_id: str, request: Request, fmt: str = "json"):
         raise HTTPException(404, "Report not ready")
     if fmt == "html":
         html = build_html_report(run, report, origin=str(request.base_url).rstrip("/"))
-        return Response(content=html, media_type="text/html",
-                        headers={"Content-Disposition": f'attachment; filename="qalchemist-{run_id[:8]}.html"'})
+        # no Content-Disposition here (unlike json below) — this is meant to be viewed as a page in
+        # a new tab, not saved to disk, and "attachment" forces a download dialog instead of letting
+        # the browser render it inline.
+        return Response(content=html, media_type="text/html")
     return Response(content=json.dumps(report, indent=2, default=str), media_type="application/json",
                     headers={"Content-Disposition": f'attachment; filename="qalchemist-{run_id[:8]}.json"'})
 

@@ -44,12 +44,22 @@ export default function FinalReport({ report, runId, run, onViewEvidence }) {
   const hadPrd = Boolean(run?.config?.prd);
 
   const exportReport = async (fmt) => {
-    // for html, open the tab synchronously, in the same tick as the click — a browser's popup
-    // blocker only allows window.open() as a direct result of user interaction, and by the time an
-    // await'ed fetch resolves below, that "direct result of a click" window has already closed, so
-    // the tab gets silently blocked with no console error. Opening a blank tab now and pointing it
-    // at the real URL once the blob is ready keeps it inside the gesture the blocker looks for.
-    const pending = fmt === "html" ? window.open("", "_blank", "noopener") : null;
+    if (fmt === "html") {
+      // a plain <a target="_blank"> click is a direct, browser-native navigation — not a scripted
+      // window.open() — so a popup blocker never touches it, regardless of any async timing. It's a
+      // direct link straight to the backend response (no fetch/blob indirection needed); the backend
+      // sends no Content-Disposition for html, so the browser renders it as a page instead of forcing
+      // a download.
+      const a = document.createElement("a");
+      a.href = `${API}/runs/${runId}/export?fmt=html`;
+      a.target = "_blank";
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      toast.success("Report opened in a new tab");
+      return;
+    }
     try {
       const res = await fetch(`${API}/runs/${runId}/export?fmt=${fmt}`);
       if (!res.ok) {
@@ -58,24 +68,15 @@ export default function FinalReport({ report, runId, run, onViewEvidence }) {
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
-      if (fmt === "html") {
-        // a report is meant to be read, not saved — open it as a page instead of forcing a download.
-        // The object URL is intentionally not revoked here: the tab loads it asynchronously, and
-        // revoking immediately can race that load. It's cleaned up when this tab/session ends.
-        if (pending) pending.location = url;
-        else window.open(url, "_blank", "noopener"); // popup was blocked outright; nothing more to do
-      } else {
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `qalchemist-${runId.slice(0, 8)}.${fmt}`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
-      }
-      toast.success(fmt === "html" ? "Report opened in a new tab" : `Exported ${fmt.toUpperCase()} report`);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `qalchemist-${runId.slice(0, 8)}.${fmt}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.success(`Exported ${fmt.toUpperCase()} report`);
     } catch (err) {
-      pending?.close(); // don't leave a blank tab hanging open if the export itself failed
       toast.error(err.message || "Export failed");
     }
   };

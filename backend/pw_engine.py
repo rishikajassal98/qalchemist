@@ -435,20 +435,25 @@ async def _fill_targeted(page, step_text, username=None, password=None):
     last resort. Without the credentials fallback, a plan that describes the field without quoting a
     literal (the LLM doesn't always do so, even when real creds were given) would silently type dummy
     placeholder text into a real login form and misattribute the resulting failure to the app under
-    test. Returns (selector, value_filled) on success, else None so the caller can fall back to the
-    generic multi-input fill."""
+    test. Returns (selector, value_filled, is_operator_secret) on success, else None so the caller can
+    fall back to the generic multi-input fill. `is_operator_secret` is True only when the value that
+    got filled was the operator's own real username/password (not a literal from the plan, not a dummy)
+    — the one case a caller must never echo verbatim into a log line."""
     t = step_text.lower()
     m = _QUOTED_RE.search(step_text)
     value = (m.group(1) if m and m.group(1) is not None else (m.group(2) if m else None))
+    used_operator_secret = False
 
     if "password" in t:
         selector, kind = 'input[type="password"]', "password"
-        value = value or password
+        if value is None and password:
+            value, used_operator_secret = password, True
     elif "email" in t:
         selector, hint, kind = 'input[type="email"]', "email", "email"
     elif "username" in t or "user name" in t or "login" in t:
         selector, kind = 'input[type="text"], input[type="email"], input[name*="user" i]', "text"
-        value = value or username
+        if value is None and username:
+            value, used_operator_secret = username, True
     else:
         return None
 
@@ -459,7 +464,7 @@ async def _fill_targeted(page, step_text, username=None, password=None):
         return None
     fill_value = value if value else DUMMY_VALUES.get(kind, DUMMY_VALUES["text"]).format(n=int(time.time()) % 10000)
     await loc.fill(fill_value, timeout=3000)
-    return selector, fill_value
+    return selector, fill_value, used_operator_secret
 
 
 _FIELD_SCAN_JS = """
@@ -587,8 +592,13 @@ async def _execute_step(page, step_text, spec_selectors, base_url, prev_url, use
         if any(k in t for k in ("fill", "enter", "type", "input")):
             targeted = await _fill_targeted(page, step_text, username=username, password=password)
             if targeted:
-                sel, val = targeted
-                return {"ok": True, "locator": sel, "note": f"filled '{val}'"}
+                sel, val, is_secret = targeted
+                # the operator's own real username/password must never appear in plaintext in a log
+                # line — this event is persisted to Mongo and streamed live to anyone watching the
+                # Decision Stream, neither of which is where a real credential belongs. A plan-authored
+                # literal or dummy placeholder isn't sensitive, so only this specific case is masked.
+                shown = "•" * min(len(val), 8) if is_secret else val
+                return {"ok": True, "locator": sel, "note": f"filled '{shown}'"}
             filled = await _fill_visible_inputs(page, int(time.time()) % 10000)
             if not filled:
                 return {"ok": True, "note": "no empty inputs found to fill"}
