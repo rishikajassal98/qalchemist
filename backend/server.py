@@ -8,6 +8,17 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict
 
+if sys.platform == "win32":
+    # uvicorn's default ("auto"/"asyncio") loop backend forces WindowsSelectorEventLoopPolicy on
+    # Windows (see uvicorn/loops/asyncio.py) for its own signal-handling reasons -- but
+    # SelectorEventLoop has no subprocess transport on Windows, so Playwright's browser launch
+    # (which spawns the browser via asyncio.create_subprocess_exec) fails with a bare
+    # NotImplementedError the moment EXPLORE/RUN/HEAL touch a real browser. Run uvicorn with
+    # `--loop none` (see README) so this policy sticks instead of being overwritten right after
+    # this module is imported; this line is a no-op then, and just a safety net for any other
+    # ASGI server / invocation that imports this module without forcing Selector itself.
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from fastapi import FastAPI, APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles

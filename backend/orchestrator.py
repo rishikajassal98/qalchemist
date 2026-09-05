@@ -159,6 +159,9 @@ class GraphState(TypedDict, total=False):
     specs: list
     executions: list
     actions: list
+    still_failing_count: int
+    heal_retried: bool
+    validate_feedback: dict
     report: dict
 
 
@@ -217,6 +220,8 @@ class Orchestrator:
         g.add_node("generate", self._node_generate)
         g.add_node("run_tests", self._node_run)
         g.add_node("heal", self._node_heal)
+        g.add_node("validate", self._node_validate)
+        g.add_node("prepare_retry", self._node_prepare_retry)
         g.add_node("report", self._node_report)
         g.add_node("persist_memory", self._node_persist_memory)
 
@@ -240,7 +245,16 @@ class Orchestrator:
         g.add_edge("pause_gate", "generate")
         g.add_edge("generate", "run_tests")
         g.add_edge("run_tests", "heal")
-        g.add_edge("heal", "report")
+        g.add_edge("heal", "validate")
+        # conditional edge: if healing still leaves flows unresolved (an attempted heal that didn't
+        # verify, i.e. escalated to "review"), send control back to re-plan and re-run those flows
+        # once before reporting, instead of reporting on a plan/spec that's already known to be
+        # incomplete. A run that has already been through one validate-retry cycle always falls
+        # through to REPORT regardless of this second attempt's outcome (see _route_after_validate),
+        # so this can never loop more than once.
+        g.add_conditional_edges("validate", self._route_after_validate,
+                                {"retry": "prepare_retry", "report": "report"})
+        g.add_edge("prepare_retry", "plan")
         g.add_edge("report", "persist_memory")
         g.add_edge("persist_memory", END)
         return g.compile()
@@ -262,6 +276,18 @@ class Orchestrator:
         if high_gaps or evaluation.get("prd_gaps"):
             return "replan"
         return "pause_gate"
+
+    @staticmethod
+    def _route_after_validate(state: "GraphState") -> str:
+        # only one validate-retry cycle -- once this run has already looped back through PLAN/RUN
+        # once because of a heal that didn't verify (`heal_retried`), always report regardless of
+        # what this second attempt's validation finds, so a genuinely stubborn app defect can't
+        # loop the pipeline forever.
+        if state.get("heal_retried"):
+            return "report"
+        if state.get("still_failing_count", 0) > 0:
+            return "retry"
+        return "report"
 
     # ---- node wrappers: thin adapters from GraphState to the stage implementations ----
     async def _node_recall_memory(self, state: GraphState) -> dict:
@@ -288,9 +314,12 @@ class Orchestrator:
         return {"surface": surface}
 
     async def _node_plan(self, state: GraphState) -> dict:
+        # a validate-retry loop (HEAL -> VALIDATE -> here) re-enters this same node with
+        # `validate_feedback` set; the initial pass has none, so `feedback` stays None as before.
         flows = await self._stage_plan(state["run_id"], state["config"], state["surface"],
                                         self._model(state["config"], "planner"),
-                                        memory=state.get("memory") or {})
+                                        memory=state.get("memory") or {},
+                                        feedback=state.get("validate_feedback"))
         return {"flows": flows}
 
     async def _node_evaluate(self, state: GraphState) -> dict:
@@ -341,6 +370,27 @@ class Orchestrator:
                                           self._model(state["config"], "healer"),
                                           memory=state.get("memory") or {})
         return {"actions": actions}
+
+    async def _node_validate(self, state: GraphState) -> dict:
+        still_failing = await self._stage_validate(state["run_id"], state.get("actions") or [])
+        return {"still_failing_count": len(still_failing)}
+
+    async def _node_prepare_retry(self, state: GraphState) -> dict:
+        run_id, actions = state["run_id"], state.get("actions") or []
+        still_failing = [a for a in actions if a.get("decision") == "review" and not a.get("healed")]
+        names = ", ".join(sorted({a["flow_name"] for a in still_failing})) or "unknown flow(s)"
+        await self.emit(run_id, "HEAL", "meta", "warn", "decision",
+                        f"Meta-agent decision: validation after healing found {len(still_failing)} flow(s) "
+                        f"still failing ({names}) — regenerating the plan and re-running before reporting, "
+                        "instead of reporting on a spec already known to be broken. This retry happens at "
+                        "most once per run.")
+        await self._handoff(
+            run_id, "HEAL", "healer", "planner", "validation",
+            f"{len(still_failing)} flow(s) still failing after healing", level="warn")
+        feedback = {"validation_retry": True,
+                   "still_failing_flows": [{"flow_name": a["flow_name"], "fail_type": a.get("fail_type"),
+                                             "rationale": a.get("rationale")} for a in still_failing]}
+        return {"heal_retried": True, "validate_feedback": feedback}
 
     async def _node_report(self, state: GraphState) -> dict:
         report = await self._stage_report(state["run_id"], state["config"], state["surface"],
@@ -491,9 +541,14 @@ class Orchestrator:
         memory = memory or {}
         await self.set_stage(run_id, "PLAN", "running")
         label = "re-planning" if feedback else "synthesizing"
+        if feedback and feedback.get("validation_retry"):
+            feedback_note = " after validation found flows still failing post-heal"
+        elif feedback:
+            feedback_note = " with evaluator feedback"
+        else:
+            feedback_note = ""
         await self.emit(run_id, "PLAN", "planner", "info", "stage_start",
-                        f"Planner ({model}) {label} user-flow test plan"
-                        f"{' with evaluator feedback' if feedback else ''}...")
+                        f"Planner ({model}) {label} user-flow test plan{feedback_note}...")
         system = ("You are an expert QA test planner. Given a web app's discovered surface, produce meaningful "
                   "end-to-end test flows including happy paths, edge cases, and error/negative paths. "
                   "Return ONLY JSON: {\"flows\":[{\"flow_id\":\"F1\",\"name\":\"...\",\"type\":\"happy|edge|error\","
@@ -510,7 +565,11 @@ class Orchestrator:
                       f"{json.dumps([{'flow': d.get('flow_name'), 'fail_type': d.get('fail_type'), 'seen': d.get('count')} for d in recurring]) if recurring else 'none'}\n"
                       f"- Persistent coverage gap areas: {json.dumps(gap_areas) if gap_areas else 'none'}\n"
                       "Prioritize flows that re-test these known trouble spots.\n\n")
-        if feedback:
+        if feedback and feedback.get("validation_retry"):
+            prompt += (f"VALIDATION AFTER HEALING FOUND FLOWS STILL FAILING — the new plan MUST address "
+                       f"them explicitly (different steps/selectors, not a repeat of the same approach):\n"
+                       f"{json.dumps(feedback)[:1500]}\n\n")
+        elif feedback:
             prompt += (f"A PLAN EVALUATOR AUDITED YOUR PREVIOUS PLAN AND FOUND THESE GAPS — the new plan MUST "
                        f"address them explicitly:\n{json.dumps(feedback)[:1500]}\n\n")
         prompt += "Produce the test plan JSON."
@@ -981,6 +1040,26 @@ class Orchestrator:
             f"{len(actions)} actions")
         await self.set_stage(run_id, "HEAL", "done")
         return actions
+
+    # ---- VALIDATE ----
+    async def _stage_validate(self, run_id, actions):
+        """Post-heal gate: a script heal that HEAL already live-replayed and confirmed passing
+        (decision == "script", healed == True) or a genuine app defect (decision == "defect", which
+        re-planning can't fix -- only a real app-code change can) are both terminal outcomes. Only
+        "review" -- a heal was attempted but its live replay still failed -- is a candidate for
+        another PLAN/RUN cycle, since a fresh plan or regenerated spec might succeed where the first
+        attempt didn't."""
+        still_failing = [a for a in actions if a.get("decision") == "review" and not a.get("healed")]
+        if still_failing:
+            names = ", ".join(sorted({a["flow_name"] for a in still_failing}))
+            await self.emit(run_id, "HEAL", "healer", "warn", "log",
+                            f"Validator: {len(still_failing)}/{len(actions)} healer action(s) still "
+                            f"unresolved after healing ({names}).")
+        else:
+            await self.emit(run_id, "HEAL", "healer", "success", "log",
+                            f"Validator: all {len(actions)} healer action(s) resolved (healed or a "
+                            "confirmed defect) -- nothing left to re-plan.")
+        return still_failing
 
     # ---- REPORT ----
     async def _compute_flakiness_trend(self, config):

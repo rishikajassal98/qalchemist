@@ -8,15 +8,31 @@ Paste a target web-app URL (+ optional login creds, PRD, or natural-language int
 meta-agent explores it with a real headless browser, plans meaningful test flows, audits coverage gaps,
 generates Playwright specs with live selector validation, runs them for real, self-heals broken scripts
 (verified by replaying the fix in a live browser, not assumed) vs. classifies genuine app defects —
-streaming every decision live and producing an exportable test-quality report.
+streaming every decision live and producing an exportable test-quality report. Run it again against a
+target it's already seen, and it remembers: known-good selectors, previously healed locators, and
+recurring defects that graduate into confirmed regressions.
 
-**Pipeline (state machine):** `EXPLORE → PLAN → EVALUATE → GENERATE → RUN → HEAL → REPORT`
+**Pipeline (LangGraph `StateGraph`):**
+`RECALL MEMORY → [EXPLORE|APPLY LEARNING→EXPLORE] → PLAN → EVALUATE → PAUSE GATE → GENERATE → RUN → HEAL → VALIDATE → REPORT → PERSIST MEMORY`
 
-The meta-agent is not a fixed one-pass pipeline: if the Evaluator finds a high-severity coverage gap or
-an unmet PRD requirement, it escalates back to the Planner with that feedback for one re-planning pass
-before generation proceeds — see [Architecture](#architecture) below.
+The meta-agent is not a fixed one-pass pipeline — it's a compiled LangGraph `StateGraph`, and branching
+is expressed as real, typed graph edges rather than inline `if`s:
 
-**Stack:** React + Tailwind + shadcn/ui · FastAPI (async) · MongoDB · Playwright (Chromium) · Sarvam AI (sarvam-105b)
+- **Learning gate** — `RECALL MEMORY` looks up this target's history by URL; a *returning* target routes
+  through `APPLY LEARNING` (surfacing what was learned before EXPLORE even runs), a first-time target
+  skips straight to `EXPLORE`.
+- **Re-plan loop** — if the Evaluator finds a high-severity coverage gap or an unmet PRD requirement, the
+  graph escalates back to the Planner with that feedback for one re-planning pass before generation
+  proceeds.
+- **Validate-retry loop** — if a heal is attempted but doesn't verify on live replay, `VALIDATE` sends the
+  pipeline back through `PLAN → RUN` once more (with the still-failing flows as feedback) instead of
+  reporting on a spec already known to be broken.
+
+Both retry loops are capped at exactly one cycle (tracked in graph state), so a genuinely broken target
+can't loop the pipeline forever — see [Architecture](#architecture) and
+[Memory & cross-run learning](#memory--cross-run-learning) below.
+
+**Stack:** React + Tailwind + shadcn/ui · FastAPI (async) · LangGraph · MongoDB · Playwright (Chromium) · Sarvam AI (sarvam-105b)
 
 ---
 
@@ -26,26 +42,59 @@ before generation proceeds — see [Architecture](#architecture) below.
 flowchart TD
     U[Developer: URL + optional PRD / creds / intent] --> META
 
-    subgraph META["Meta-agent orchestrator (orchestrator.py)"]
+    subgraph META["Meta-agent orchestrator — LangGraph StateGraph (orchestrator.py)"]
         direction TB
+        RECALL["RECALL MEMORY<br/>agent_memory lookup<br/>by target URL"] -->|"returning target"| LEARN
+        RECALL -->|"first-time target"| EXPLORE
+        LEARN["APPLY LEARNING<br/>surface known selectors,<br/>healed locators, insights"] --> EXPLORE
         EXPLORE["EXPLORE<br/>real Chromium crawl<br/>(pw_engine.py)"] --> PLAN
-        PLAN["PLAN<br/>Planner sub-agent"] --> EVAL
-        EVAL["EVALUATE<br/>coverage-gap + PRD-gap audit"] -->|"gap found:<br/>re-plan decision"| PLAN
-        EVAL -->|"plan is sufficient"| GEN
-        GEN["GENERATE<br/>Playwright specs +<br/>live selector validation"] --> RUN
+        PLAN["PLAN<br/>Planner sub-agent<br/>+ memory context"] --> EVAL
+        EVAL["EVALUATE<br/>coverage/PRD-gap audit +<br/>confirmed-regression flows"] -->|"gap found:<br/>re-plan decision"| PLAN
+        EVAL -->|"plan is sufficient"| GATE
+        GATE["PAUSE GATE<br/>optional operator approval"] --> GEN
+        GEN["GENERATE<br/>Playwright specs, live selector<br/>validation, cached-spec reuse"] --> RUN
         RUN["RUN<br/>real parallel Chromium<br/>execution"] --> HEAL
-        HEAL["HEAL<br/>heuristic + LLM classify<br/>script vs. defect,<br/>fix verified by live replay"] --> REPORT
-        REPORT["REPORT<br/>test-quality report"]
+        HEAL["HEAL<br/>heuristic + LLM classify script<br/>vs. defect, fix verified by live<br/>replay, known fixes reused"] --> VALIDATE
+        VALIDATE["VALIDATE<br/>still-failing check"] -->|"unresolved:<br/>re-plan decision"| PLAN
+        VALIDATE -->|"resolved"| REPORT
+        REPORT["REPORT<br/>test-quality report"] --> PERSIST
+        PERSIST["PERSIST MEMORY<br/>update agent_memory +<br/>pattern insights"]
     end
 
     HEAL -->|"heal doesn't verify"| ESCALATE[["escalated to<br/>human review"]]
-    REPORT --> OUT[Report: pass/fail, healer actions,<br/>coverage gaps, untested-flow risk,<br/>screenshots/video/trace]
+    PERSIST --> OUT[Report: pass/fail, healer actions,<br/>coverage gaps, untested-flow risk,<br/>flaky/regression insights,<br/>screenshots/video/trace]
 ```
 
 Every stage streams its decisions live over SSE to the frontend's Decision Stream. When the LLM
 (Sarvam AI) is unavailable or rate-limited, each stage has a deterministic fallback derived from the
 real discovered surface (not a fixed generic template) so the pipeline never silently stalls or produces
 misleading output — see `_fallback_flows` / `_fallback_evaluation` in `orchestrator.py`.
+
+Both retry edges (`EVALUATE → PLAN` and `VALIDATE → PLAN`) are one-shot: each is gated by a flag carried
+in the graph's typed state (`replanned`, `heal_retried`) that the router checks before allowing another
+loop, so a second pass through either edge always falls through instead of looping again.
+
+---
+
+## Memory & cross-run learning
+
+Every run's target URL is normalized (host + path) into an `agent_memory` key in MongoDB — recalled by
+the `RECALL MEMORY` node before EXPLORE, and updated by `PERSIST MEMORY` after REPORT. Run the same
+target again and the pipeline behaves differently because of what it remembers:
+
+| Remembered | Used by | Effect on the next run |
+|---|---|---|
+| Known-good selectors (validated across runs) | GENERATE | seeded into the LLM prompt + the selector-validation pool, so proven locators are reused instead of reinvented |
+| Healed locator map (`old selector → new selector`) | HEAL | a previously-fixed selector is reapplied directly — no LLM classification needed for that failure |
+| Recurring defect signatures (`flow name :: fail type`) | PLAN, EVALUATE, HEAL | ≥2 occurrences becomes a **confirmed regression**: EVALUATE force-adds a dedicated regression-check flow, and HEAL auto-classifies a repeat as a defect (skipping the LLM call) with escalated severity |
+| Coverage-gap areas | PLAN | prompted to prioritize flows for known trouble spots |
+| Cached, fully-verified specs (keyed by flow name + a hash of its steps) | GENERATE | an unchanged flow with stable selectors is reused verbatim, skipping a fresh LLM call entirely |
+| Per-flow pass/heal history | PERSIST MEMORY | drives **flaky-flow** detection (alternates pass/fail across runs) and **chronic-selector-instability** detection (healed ≥2 times) — surfaced as `pattern_insight` events and on the report |
+
+This is the literal "if the URL comes again, pick up the learning" behavior: `RECALL MEMORY`'s
+conditional edge routes a target with `run_count > 0` through `APPLY LEARNING` before EXPLORE; a
+first-time target skips it entirely. See `_stage_recall_memory` / `_stage_persist_memory` /
+`_detect_insights` in `orchestrator.py`.
 
 ---
 
@@ -117,8 +166,20 @@ SARVAM_API_KEY=sk_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 Run the backend:
 
 ```bash
+# macOS / Linux
 uvicorn server:app --host 0.0.0.0 --port 8001 --reload
+
+# Windows -- use the launcher script instead of the plain `uvicorn` CLI (see note below)
+python run.py --reload
 ```
+
+> **Windows:** don't use the bare `uvicorn server:app ...` command — its "auto"/"asyncio" loop
+> backend forces `WindowsSelectorEventLoopPolicy`, and `SelectorEventLoop` has no subprocess
+> transport, so Playwright's browser launch fails with a bare `NotImplementedError` the moment
+> EXPLORE/RUN/HEAL touch a real browser. The fix is `loop="none"`, but uvicorn's CLI rejects
+> `--loop none` as an invalid choice (even though uvicorn itself supports it) -- only its
+> programmatic API accepts it. `run.py` is a two-line wrapper that calls `uvicorn.run(..., loop="none")`
+> so Windows keeps its normal Proactor policy (which supports subprocesses). Not needed on macOS/Linux.
 
 Backend is now at **http://localhost:8001** (health check: http://localhost:8001/api/).
 
@@ -161,6 +222,11 @@ App opens at **http://localhost:3000**.
    **Run Autonomous Pipeline**.
 4. Watch the live DAG + decision stream; explore the Plan / Audit / Code / Runner / Healer / Report tabs;
    export the report as HTML or JSON.
+5. **To demo the learning:** run the *same* URL a second time. The Decision Stream opens with an
+   `Agent Memory` recall event and (for a returning target) a "Meta-agent decision: recognized a
+   returning target..." log before EXPLORE even starts — listing known selectors, healed locators, and
+   any confirmed regressions carried over from the first run. No extra setup: `agent_memory` is a plain
+   MongoDB collection, created automatically on first write.
 
 ---
 
@@ -177,6 +243,13 @@ App opens at **http://localhost:3000**.
   review instead of being reported as successful.
 - **Artifacts** (screenshots, video, Playwright trace) are real files written to
   `backend/run_artifacts/<run_id>/` and served at `/artifacts/...`; linked from the Runner tab.
+- **Orchestration is a LangGraph `StateGraph`** (`orchestrator.py: Orchestrator._build_graph`), not a
+  hand-rolled sequence of `await`s — every stage is a graph node, and both retry loops (re-plan,
+  validate-retry) plus the memory-driven learning branch are real conditional edges. `langgraph` is
+  already pinned in `requirements.txt`; no extra install step.
+- **Cross-run memory** needs no extra setup — `agent_memory` is just another collection in the same
+  Mongo database (`DB_NAME` from `.env`), keyed by normalized target URL, read before EXPLORE and
+  written after REPORT. See [Memory & cross-run learning](#memory--cross-run-learning) above.
 
 ---
 
@@ -187,6 +260,7 @@ App opens at **http://localhost:3000**.
 | `ModuleNotFoundError: emergentintegrations` | Re-run the install in step 3 with `--extra-index-url` |
 | `ResolutionImpossible` / `resolution-too-deep` on `pip install` | Use the `--no-deps` install command from step 3 — this file is a pinned lockfile, so let pip skip resolution instead of re-solving the graph |
 | `Executable doesn't exist ... chromium` at run time | Run `playwright install chromium` in the backend venv |
+| `NotImplementedError` from `playwright/_impl/_transport.py` / `asyncio/subprocess.py` (Windows only) | Run the backend with `python run.py --reload` instead of the bare `uvicorn` command (see step 3) — the plain CLI can't set the event-loop mode Playwright needs on Windows |
 | Frontend can't reach backend / CORS error | Check `REACT_APP_BACKEND_URL=http://localhost:8001` and that backend is running |
 | `pymongo.errors.ServerSelectionTimeoutError` | MongoDB isn't running / wrong `MONGO_URL` |
 | Runs stall or degrade in `PLAN`/`EVALUATE`/`GENERATE`/`HEAL` | LLM rate limiting or timeout — the Decision Stream will say "using deterministic/heuristic fallback"; runs still complete end to end |
@@ -200,8 +274,9 @@ App opens at **http://localhost:3000**.
 # frontend static build
 cd frontend && yarn build      # outputs to frontend/build
 
-# backend (no --reload) behind a process manager
-cd backend && uvicorn server:app --host 0.0.0.0 --port 8001
+# backend behind a process manager
+cd backend && uvicorn server:app --host 0.0.0.0 --port 8001       # macOS / Linux
+cd backend && python run.py                                       # Windows (see step 3)
 ```
 
 Serve `frontend/build` with any static host (Nginx, Vercel, Netlify) and point
