@@ -809,11 +809,13 @@ class Orchestrator:
             finally:
                 worker_slots.put_nowait(worker_id)
 
+        headed = bool(config.get("headed"))
         async with async_playwright() as p:
             # slow_mo paces every real action (click/fill/goto) — a simple site can otherwise finish
             # a whole flow in well under a second, producing a technically-real but unwatchably short
             # video. This only adds wall-clock pacing; it changes no selectors, assertions or results.
-            browser = await p.chromium.launch(headless=True, slow_mo=350)
+            # In headed mode slow_mo is bumped so a human watching the window can follow each action.
+            browser = await p.chromium.launch(headless=not headed, slow_mo=700 if headed else 350)
             try:
                 tasks = [asyncio.create_task(run_one(browser, spec)) for spec in specs]
                 for coro in asyncio.as_completed(tasks):
@@ -827,9 +829,12 @@ class Orchestrator:
 
     async def _stage_run(self, run_id, config, surface, specs):
         await self.set_stage(run_id, "RUN", "running")
-        workers = max(1, int(config.get("workers", 3)))
+        headed = bool(config.get("headed"))
+        # Headed mode is for watching a live demo — one visible window, not N racing windows.
+        workers = 1 if headed else max(1, int(config.get("workers", 3)))
+        mode_desc = "a visible headed browser window" if headed else "real headless Chromium"
         await self.emit(run_id, "RUN", "runner", "info", "stage_start",
-                        f"Runner executing {len(specs)} specs on real headless Chromium ({workers} parallel workers)...")
+                        f"Runner executing {len(specs)} specs on {mode_desc} ({workers} parallel workers)...")
 
         async def on_step(spec, step_entry, total_steps):
             lvl = "info" if step_entry["ok"] else "warn"
@@ -1387,12 +1392,24 @@ def _primary_cta_candidate(pages):
     return None
 
 
+def _is_login_form(form):
+    """A form with a password field is a credentials form. Every flow runs against the run's single,
+    already-authenticated storage_state_path (set once per run — see orchestrator.py's RUN stage), and
+    an authenticated session gets redirected away from the login page, so a generic fill/submit flow
+    built from a login form can never actually reach it — it would only ever find "no empty inputs" on
+    whatever authenticated page it lands on instead, then time out looking for a submit control that
+    isn't there."""
+    return any((f.get("type") or "").lower() == "password" for f in (form.get("fields") or []))
+
+
 def _fallback_flows(surface):
     """Deterministic plan used when the LLM is unavailable. Derived from what EXPLORE actually
     found (discovered pages/forms) rather than a fixed generic template, so an offline demo still
     visibly reflects the real target instead of always producing the same three canned flows."""
     pages = surface.get("pages", [])
-    forms = surface.get("forms", [])
+    # exclude login forms — see _is_login_form — so this only builds a generic form-test flow for a
+    # form that's actually reachable in the run's authenticated context.
+    forms = [f for f in surface.get("forms", []) if not _is_login_form(f)]
     action_pages = [p for p in pages if p.get("discovered_via") == "action_chain"]
     home_title = (pages[0].get("title") if pages else "") or ""
     title_suffix = f' ("{home_title}")' if home_title else ""
@@ -1507,7 +1524,7 @@ def _fallback_evaluation(surface, flows, prd):
     flow_text = " ".join((f.get("name", "") + " " + " ".join(f.get("steps", []) or [])) for f in flows).lower()
     coverage_gaps, prd_gaps, added_flows, risk_notes = [], [], [], []
 
-    forms = surface.get("forms", [])
+    forms = [f for f in surface.get("forms", []) if not _is_login_form(f)]
     tests_form = any(k in flow_text for k in ("form", "submit", "field"))
     if forms and not tests_form:
         coverage_gaps.append({"area": "Forms", "severity": "high",
@@ -1553,7 +1570,7 @@ def _fallback_evaluation(surface, flows, prd):
 _SPEC_QUOTED_RE = re.compile(r"'([^']*)'|\"([^\"]*)\"")
 _SPEC_STOPWORDS_RE = re.compile(
     r"^(click|select|choose|tap|press|enter|fill|type|assert|verify|check|navigate to|go to|visit|open|"
-    r"the|a|an|and|then|on|to|into)\s+", re.I)
+    r"proceed|continue|submit|confirm|the|a|an|and|then|on|to|into)\s+", re.I)
 
 
 def _spec_keywords(step: str) -> str:
@@ -1569,7 +1586,7 @@ def _spec_keywords(step: str) -> str:
         if lit and lit.strip():
             return re.escape(lit.strip()[:40])
     t = step.split(",")[0]  # drop trailing aside
-    t = re.sub(r"\b(button|link|field|element|page)\b", "", t, flags=re.I).strip()
+    t = re.sub(r"\b(button|link|field|element|page|item|product)\b", "", t, flags=re.I).strip()
     prev = None
     while prev != t:
         prev = t

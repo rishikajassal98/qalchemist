@@ -40,6 +40,7 @@ export default function RunForm({ onSubmit }) {
   const [budget, setBudget] = useState("standard");
   const [workers, setWorkers] = useState("3");
   const [pause, setPause] = useState(false);
+  const [headed, setHeaded] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [models, setModels] = useState({ planner: "sarvam-105b", evaluator: "sarvam-105b", generator: "sarvam-105b", healer: "sarvam-105b" });
 
@@ -47,7 +48,7 @@ export default function RunForm({ onSubmit }) {
 
   const submit = () => {
     onSubmit({ url, login_url: loginUrl || null, username: username || null, password: password || null,
-      prd: prd || null, intent: intent || null, budget, workers: parseInt(workers), pause_after_plan: pause, models });
+      prd: prd || null, intent: intent || null, budget, workers: parseInt(workers), pause_after_plan: pause, headed, models });
   };
 
   return (
@@ -147,6 +148,10 @@ export default function RunForm({ onSubmit }) {
             <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-[#07090e] px-3 h-11 mt-auto">
               <span className="text-sm text-slate-300">Pause for plan approval</span>
               <Switch data-testid="run-form-pause-switch" checked={pause} onCheckedChange={setPause} />
+            </div>
+            <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-[#07090e] px-3 h-11">
+              <span className="text-sm text-slate-300">Watch it run (headed browser)</span>
+              <Switch data-testid="run-form-headed-switch" checked={headed} onCheckedChange={setHeaded} />
             </div>
           </div>
 
