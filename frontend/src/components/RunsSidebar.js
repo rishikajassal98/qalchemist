@@ -77,7 +77,8 @@ export default function RunsSidebar({ runs, activeRunId, onSelect, onRerun }) {
               </button>
               {TERMINAL.includes(r.status) && (
                 <div className="px-3 pb-2 flex justify-end -mt-1">
-                  <TipIconButton data-testid={`rerun-history-${r.id}`} label="Rerun with the same configuration"
+                  <TipIconButton data-testid={`rerun-history-${r.id}`}
+                    label="Re-run from the Runner, reusing the same plan & specs (falls back to a full run if none exist)"
                     onClick={() => onRerun?.(r.id)} className="text-slate-500 hover:text-emerald-400 h-6 w-6">
                     <RotateCcw className="w-3 h-3" />
                   </TipIconButton>

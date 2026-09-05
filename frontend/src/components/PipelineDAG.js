@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Check, Loader2, Search, ListChecks, ShieldAlert, Code2, PlayCircle, Wrench, FileBarChart, PlayCircle as Play, Square, RotateCcw } from "lucide-react";
 import { STAGES, STAGE_META, EDGE_HANDOFF } from "@/api";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 
 const ICONS = {
   EXPLORE: Search, PLAN: ListChecks, EVALUATE: ShieldAlert, GENERATE: Code2,
@@ -147,10 +148,18 @@ export default function PipelineDAG({ stageStatus, stageDuration, run, awaiting,
             </Button>
           )}
           {TERMINAL.includes(run?.status) && (
-            <Button data-testid="rerun-run-button" onClick={onRerun} size="sm" variant="outline"
-              className="h-7 border-emerald-500/40 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50 hover:text-emerald-200 text-xs">
-              <RotateCcw className="w-3 h-3 mr-1" /> Rerun
-            </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button data-testid="rerun-run-button" onClick={onRerun} size="sm" variant="outline"
+                  className="h-7 border-emerald-500/40 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50 hover:text-emerald-200 text-xs">
+                  <RotateCcw className="w-3 h-3 mr-1" /> Rerun
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-xs font-mono text-[11px]">
+                Re-runs from the Runner onward, reusing this run's plan and generated specs — EXPLORE/PLAN/EVALUATE/GENERATE
+                are not repeated. Falls back to a full run if this run never got as far as GENERATE.
+              </TooltipContent>
+            </Tooltip>
           )}
         </div>
       </div>

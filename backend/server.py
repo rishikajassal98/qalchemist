@@ -49,6 +49,10 @@ RUN_PUBLIC = {"_id": 0, "surface": 0, "config_secrets": 0}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+# the Sarvam SDK is itself built on httpx, so its "HTTP Request: POST ... 200 OK" line fires on every
+# Sarvam call regardless of using the SDK vs raw httpx -- quiet that one logger specifically rather
+# than dropping INFO globally, so genuine app logs aren't lost along with it.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def now_iso():
@@ -80,14 +84,18 @@ async def root():
     return {"message": "QAlchemist orchestration API", "stages": STAGES}
 
 
-def _launch_run(run_id: str, config: dict):
-    task = asyncio.create_task(orch.run(run_id, config))
+def _launch_task(run_id: str, coro):
+    task = asyncio.create_task(coro)
     _run_tasks[run_id] = task
 
     def _clear(t, rid=run_id):
         _run_tasks.pop(rid, None)
     task.add_done_callback(_clear)
     return task
+
+
+def _launch_run(run_id: str, config: dict):
+    return _launch_task(run_id, orch.run(run_id, config))
 
 
 @api_router.post("/runs")
@@ -164,8 +172,12 @@ async def abort_run(run_id: str):
 
 @api_router.post("/runs/{run_id}/rerun")
 async def rerun_run(run_id: str):
-    """Clone a finished run's configuration into a new run (completed, failed, or aborted)."""
-    source = await db.runs.find_one({"id": run_id}, {"_id": 0, "surface": 0})
+    """Re-execute a finished run (completed, failed, or aborted) starting from the Runner, reusing
+    the source run's already-discovered surface, plan and generated specs instead of paying for a
+    fresh EXPLORE crawl and PLAN/EVALUATE/GENERATE LLM calls every time. Falls back to a full
+    from-scratch run only if the source never got far enough to have specs to reuse (e.g. aborted
+    during EXPLORE)."""
+    source = await db.runs.find_one({"id": run_id})
     if not source:
         raise HTTPException(404, "Run not found")
     if source.get("status") in ("queued", "running", "paused"):
@@ -180,7 +192,31 @@ async def rerun_run(run_id: str):
         parsed = RunConfig(**{k: v for k, v in ((k, cfg.get(k)) for k in RunConfig.model_fields) if v is not None})
     except Exception as e:
         raise HTTPException(400, f"Stored config cannot be rerun: {e}")
-    return await create_run(parsed)
+
+    has_specs = await db.test_specs.count_documents({"run_id": run_id}, limit=1) > 0
+    if not source.get("surface") or not has_specs:
+        # nothing to reuse (e.g. aborted before GENERATE) -- only path that makes sense is a full run
+        return await create_run(parsed)
+
+    new_run_id = str(uuid.uuid4())
+    auth_mode = "authenticated" if (parsed.username and parsed.password) else "public"
+    config = parsed.model_dump()
+    config["auth_mode"] = auth_mode
+    safe_config = {**config, "password": "***" if parsed.password else None}
+    run_doc = {
+        "id": new_run_id, "url": parsed.url, "status": "queued", "auth_mode": auth_mode,
+        "config": safe_config, "created_at": now_iso(), "updated_at": now_iso(),
+        "current_stage": "RUN",
+        "stages": {s: "pending" for s in STAGES},
+        "rerun_of": run_id,
+    }
+    if parsed.password:
+        run_doc["config_secrets"] = {"password": parsed.password}
+    await db.runs.insert_one(dict(run_doc))
+    _launch_task(new_run_id, orch.rerun_from_runner(new_run_id, run_id, config))
+    run_doc.pop("_id", None)
+    run_doc.pop("config_secrets", None)
+    return run_doc
 
 
 @api_router.post("/runs/{run_id}/resume")

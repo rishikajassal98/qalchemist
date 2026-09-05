@@ -14,6 +14,7 @@ import json
 import uuid
 import hashlib
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import TypedDict
 from urllib.parse import urlparse
@@ -21,18 +22,22 @@ from urllib.parse import urlparse
 import httpx
 from playwright.async_api import async_playwright
 from langgraph.graph import StateGraph, START, END
+from sarvamai import AsyncSarvamAI
+from sarvamai.core.api_error import ApiError
 
 from event_bus import bus
 import pw_engine
 
+logger = logging.getLogger(__name__)
+
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
-SARVAM_API_URL = "https://api.sarvam.ai/v1/chat/completions"
 DEFAULT_MODEL = "sarvam-105b"
 
-# retried: transient — a slow/overloaded backend or a rate limit that a short backoff can plausibly
-# clear. NOT retried (4xx other than 429): a bad API key, a malformed request, etc. — retrying those
-# just burns the run's time budget on an error that will be identical the 2nd and 3rd time too.
-LLM_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+# Retries that matter live in two places now: the official SDK retries HTTP-status failures itself
+# (429/408/409/5xx, Retry-After-aware, jittered exponential backoff -- see sarvamai.core.http_client),
+# configured via request_options below. It does NOT retry network-level timeout/connect errors, so
+# LLM_MAX_ATTEMPTS/LLM_BACKOFF_BASE_SECONDS below cover exactly that remaining gap, not a duplicate
+# of what the SDK already does.
 LLM_MAX_ATTEMPTS = 3
 LLM_BACKOFF_BASE_SECONDS = 1.5
 
@@ -67,64 +72,87 @@ def now_iso():
 # ----------------------------------------------------------------------------
 # LLM helper
 # ----------------------------------------------------------------------------
-async def llm_json(system: str, prompt: str, model: str = DEFAULT_MODEL, session: str = None, on_retry=None):
-    """Call Sarvam AI's OpenAI-compatible chat completions endpoint and parse JSON out of the reply.
+# One cached AsyncSarvamAI so the SDK's own httpx.AsyncClient (created when
+# httpx_client is omitted) is reused across calls — a fresh client per attempt
+# would redo TCP+TLS every time. Created lazily so importing this module never
+# opens a socket. timeout=70 (SDK default is 60) is the measured latency of a
+# normal successful reply, not spare margin for flakiness.
+_sarvam_client: AsyncSarvamAI | None = None
 
-    Retries up to LLM_MAX_ATTEMPTS times, but only on failures a retry can plausibly fix: a network
-    timeout/connect error, or a status in LLM_RETRYABLE_STATUS (rate limit / backend overload). A 4xx
-    like a bad API key is raised immediately on the first attempt — no amount of retrying changes it,
-    so retrying would only cost the run wall-clock time for an identical failure."""
+
+def _get_sarvam_client() -> AsyncSarvamAI:
+    global _sarvam_client
+    if _sarvam_client is None:
+        _sarvam_client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY, timeout=120)
+    return _sarvam_client
+
+
+def _api_error_detail(e: ApiError) -> str:
+    # surface Sarvam's actual error body (e.g. "No credits available.") instead of a bare status
+    # line -- that's the difference between a self-diagnosable message in the Decision Stream and
+    # a cryptic one that needs a manual API call to explain.
+    body = e.body
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return err["message"]
+        if body.get("message"):
+            return body["message"]
+    return str(body)[:200] if body else str(e)
+
+
+async def llm_json(system: str, prompt: str, model: str = DEFAULT_MODEL, session: str = None, on_retry=None):
+    """Call Sarvam AI's chat completions endpoint (via the official SDK) and parse JSON out of the
+    reply.
+
+    The SDK already retries HTTP-status failures itself (429/408/409/5xx, Retry-After-aware,
+    jittered backoff), configured via request_options below, so an ApiError it still raises means
+    those retries are already exhausted -- treated here as terminal, not retried again. The one gap
+    the SDK doesn't cover is a network-level timeout/connect error, which LLM_MAX_ATTEMPTS below
+    retries -- the same failure mode that first surfaced as "LLM call degraded (ReadTimeout)"."""
     if not SARVAM_API_KEY:
         raise RuntimeError("SARVAM_API_KEY not configured")
     last_exc = None
     for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
         try:
-            # read=70: measured against the real API, a legitimate (non-degraded) call can take
-            # 30-90s depending on how long the model's own reasoning phase runs before it starts
-            # writing the answer — this is not spare margin for network flakiness, it's the actual
-            # observed latency of a normal successful response.
-            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=70, write=10, pool=10)) as client:
-                resp = await client.post(
-                    SARVAM_API_URL,
-                    headers={
-                        "Authorization": f"Bearer {SARVAM_API_KEY}",
-                        "api-subscription-key": SARVAM_API_KEY,
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": 0.2,
-                        # Sarvam's reasoning models spend tokens on reasoning_content before writing the
-                        # final answer, and the reasoning phase alone varied 8k-32k+ chars run-to-run
-                        # on an identical prompt in testing — 8192 left zero room for the actual answer
-                        # on the slower runs (finish_reason: "length", content: null, every time). This
-                        # is sized to the model's own measured worst case, not a nice-to-have buffer.
-                        "max_tokens": 28672,
-                        "reasoning_effort": "low",
-                    },
-                )
-            if resp.status_code >= 400:
-                # surface Sarvam's actual error body (e.g. "No credits available.") instead of a bare
-                # HTTP status line — that's the difference between a self-diagnosable message in the
-                # Decision Stream and a cryptic one that needs a manual API call to explain.
-                try:
-                    detail = resp.json().get("error", {}).get("message") or resp.text[:200]
-                except Exception:
-                    detail = resp.text[:200]
-                err = RuntimeError(f"Sarvam API error {resp.status_code}: {detail}")
-                if resp.status_code not in LLM_RETRYABLE_STATUS or attempt == LLM_MAX_ATTEMPTS:
-                    raise err
-                last_exc = err
-            else:
-                text = resp.json()["choices"][0]["message"]["content"]
-                return _extract_json(text), text
+            resp = await _get_sarvam_client().chat.completions(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                model=model,
+                temperature=0.2,
+                # Sarvam's reasoning models spend tokens on reasoning_content before writing the
+                # final answer, and the reasoning phase alone varied 8k-32k+ chars run-to-run
+                # on an identical prompt in testing — 8192 left zero room for the actual answer
+                # on the slower runs (finish_reason: "length", content: null, every time). This
+                # is sized to the model's own measured worst case, not a nice-to-have buffer.
+                max_tokens=28672,
+                reasoning_effort="low",
+                request_options={"max_retries": LLM_MAX_ATTEMPTS - 1},
+            )
+            text = _llm_message_text(resp.choices[0].message)
+            return _extract_json(text), text
+        except ApiError as e:
+            # the SDK's own internal retries are already exhausted by the time this is raised.
+            detail = _api_error_detail(e)
+            logger.error(
+                "Sarvam returned an error: status=%s model=%s session=%s detail=%s body=%r",
+                e.status_code, model, session, detail, e.body,
+            )
+            raise RuntimeError(f"Sarvam API error {e.status_code}: {detail}") from e
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
             last_exc = e
+            logger.warning(
+                "Sarvam network error: attempt=%s/%s model=%s session=%s error=%s",
+                attempt, LLM_MAX_ATTEMPTS, model, session,
+                str(e) or type(e).__name__,
+            )
             if attempt == LLM_MAX_ATTEMPTS:
+                logger.error(
+                    "Sarvam network error exhausted retries: model=%s session=%s error=%s",
+                    model, session, str(e) or type(e).__name__,
+                )
                 raise
         if on_retry:
             # httpx's own timeout/connect exceptions frequently stringify to "" (no message body),
@@ -135,21 +163,159 @@ async def llm_json(system: str, prompt: str, model: str = DEFAULT_MODEL, session
     raise last_exc
 
 
+def _llm_message_text(message) -> str:
+    """Prefer the final answer (`content`). Reasoning models sometimes spend the
+    entire max_tokens budget on `reasoning_content` and leave `content` null —
+    if the JSON landed there instead, still try to recover it."""
+    for candidate in (getattr(message, "content", None), getattr(message, "reasoning_content", None)):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return ""
+
+
+def _try_load_json(snippet: str):
+    try:
+        return json.loads(snippet)
+    except Exception:
+        pass
+    try:
+        return json.JSONDecoder().raw_decode(snippet)[0]
+    except Exception:
+        return None
+
+
+def _escape_raw_controls_in_strings(s: str) -> str:
+    """LLMs often emit literal newlines/tabs inside JSON strings. Those are
+    illegal JSON; escape them so the rest of a complete object can parse."""
+    out = []
+    in_string = escape = False
+    for c in s:
+        if in_string:
+            if escape:
+                out.append(c)
+                escape = False
+            elif c == "\\":
+                out.append(c)
+                escape = True
+            elif c == '"':
+                out.append(c)
+                in_string = False
+            elif c == "\n":
+                out.append("\\n")
+            elif c == "\r":
+                out.append("\\r")
+            elif c == "\t":
+                out.append("\\t")
+            elif ord(c) < 32:
+                out.append(f"\\u{ord(c):04x}")
+            else:
+                out.append(c)
+            continue
+        if c == '"':
+            in_string = True
+        out.append(c)
+    return "".join(out)
+
+
+def _strip_trailing_commas(s: str) -> str:
+    out = []
+    in_string = escape = False
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if in_string:
+            out.append(c)
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+            continue
+        if c == ",":
+            j = i + 1
+            while j < n and s[j].isspace():
+                j += 1
+            if j < n and s[j] in "}]":
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _scan_json_containers(s: str):
+    """Return (in_string, dangling_escape, stack of expected closers)."""
+    in_string = escape = False
+    stack = []
+    for c in s:
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+        elif c == "{":
+            stack.append("}")
+        elif c == "[":
+            stack.append("]")
+        elif c in "}]" and stack and stack[-1] == c:
+            stack.pop()
+    return in_string, escape, stack
+
+
+def _close_truncated_json(s: str) -> str:
+    """Close a mid-string / mid-object cut so a prefix of the LLM payload parses.
+
+    Sarvam reasoning models regularly hit finish_reason=length; the Decision
+    Stream then showed 'could not be parsed as JSON' and we discarded a usable
+    audit (coverage_gaps, added_flows, ...) for the deterministic fallback."""
+    in_string, escape, stack = _scan_json_containers(s)
+    out = s
+    if escape:
+        out = out[:-1]
+        in_string, escape, stack = _scan_json_containers(out)
+    if in_string:
+        out += '"'
+    out = out.rstrip()
+    while out and out[-1] in ",:":
+        out = out[:-1].rstrip()
+    _, _, stack = _scan_json_containers(out)
+    while stack:
+        out += stack.pop()
+    return out
+
+
 def _extract_json(text: str):
     if not text:
         return None
     m = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
     raw = m.group(1) if m else text
-    # find first { or [
     start = min([i for i in [raw.find("{"), raw.find("[")] if i != -1], default=-1)
     if start == -1:
         return None
     snippet = raw[start:]
-    for end in range(len(snippet), 0, -1):
-        try:
-            return json.loads(snippet[:end])
-        except Exception:
-            continue
+    data = _try_load_json(snippet)
+    if data is not None:
+        return data
+    sanitized = _strip_trailing_commas(_escape_raw_controls_in_strings(snippet))
+    data = _try_load_json(sanitized)
+    if data is not None:
+        return data
+    for candidate in (sanitized, snippet):
+        data = _try_load_json(_close_truncated_json(candidate))
+        if data is not None:
+            return data
     return None
 
 
@@ -453,6 +619,79 @@ class Orchestrator:
             try:
                 await self.emit(run_id, "REPORT", "meta", "warn", "run_complete",
                                 "Run aborted by operator.")
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "failed", "error": str(e)}})
+            await self.emit(run_id, "REPORT", "meta", "error", "run_complete", f"Run failed: {e}")
+        finally:
+            _resume_events.pop(run_id, None)
+            defaultdict_seq.pop(run_id, None)
+
+    async def rerun_from_runner(self, run_id: str, source_run_id: str, config: dict):
+        """Re-execute RUN -> HEAL -> VALIDATE -> REPORT -> PERSIST_MEMORY only, reusing the source
+        run's already-discovered surface, plan and generated specs instead of re-exploring/re-planning
+        from scratch. For iterating on a flaky RUN/HEAL result (or just re-proving a heal still holds)
+        without paying for a fresh EXPLORE crawl and PLAN/EVALUATE/GENERATE LLM calls every time."""
+        _resume_events[run_id] = asyncio.Event()
+        try:
+            source = await self.db.runs.find_one({"id": source_run_id})
+            if not source or not source.get("surface"):
+                raise RuntimeError(f"Source run {source_run_id[:8]} has no explored surface to reuse")
+            surface = source["surface"]
+            plan_doc = await self.db.plans.find_one({"run_id": source_run_id}, {"_id": 0}) or {}
+            flows = plan_doc.get("flows") or []
+            specs = await self.db.test_specs.find({"run_id": source_run_id}, {"_id": 0}).to_list(200)
+            if not specs:
+                raise RuntimeError(f"Source run {source_run_id[:8]} has no generated specs to reuse")
+            for s in specs:
+                s["run_id"] = run_id  # re-homed under the new run so RUN/HEAL's writes never touch the source run's own records
+
+            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "running", "started_at": now_iso(), "surface": surface}})
+            await self.db.plans.update_one({"run_id": run_id},
+                {"$set": {"run_id": run_id, "flows": flows, "evaluation": plan_doc.get("evaluation") or {},
+                          "created_at": now_iso()}}, upsert=True)
+            await self.db.test_specs.insert_many([dict(s) for s in specs])
+
+            await self.emit(run_id, "RUN", "meta", "info", "run_start",
+                            f"Rerunning from Runner: reusing {len(flows)} flow(s) and {len(specs)} spec(s) "
+                            f"from run {source_run_id[:8]} — EXPLORE/PLAN/EVALUATE/GENERATE are not re-run.",
+                            {"config": {k: config.get(k) for k in ["url", "login_url", "intent", "budget", "auth_mode"]},
+                             "source_run_id": source_run_id})
+            # mark the reused stages "done" (not re-run) and emit one handoff per stage so the DAG
+            # and Agent Handoffs feed read the same way a normal run would, just labeled "(reused)".
+            await self.set_stage(run_id, "EXPLORE", "done")
+            await self._handoff(run_id, "EXPLORE", "explorer", "planner", "surface",
+                                f"{len(surface.get('pages', []))} pages (reused)")
+            await self.set_stage(run_id, "PLAN", "done")
+            await self._handoff(run_id, "PLAN", "planner", "evaluator", "flows", f"{len(flows)} flows (reused)")
+            await self.set_stage(run_id, "EVALUATE", "done")
+            await self._handoff(run_id, "EVALUATE", "evaluator", "generator", "evaluation", "reused from source run")
+            await self.set_stage(run_id, "GENERATE", "done")
+            await self._handoff(run_id, "GENERATE", "generator", "runner", "specs", f"{len(specs)} specs (reused)")
+            for f in flows:
+                await self.emit(run_id, "PLAN", "planner", "info", "plan_flow", f"[{f['type'].upper()}] {f['name']}", {"flow": f})
+            for s in specs:
+                await self.emit(run_id, "GENERATE", "generator", "success", "spec",
+                                f"Reused {s['filename']} from run {source_run_id[:8]}.", {"spec": s})
+
+            memory = await self._stage_recall_memory(run_id, config)
+            executions = await self._stage_run(run_id, config, surface, specs)
+            actions = await self._stage_heal(run_id, config, surface, executions, specs,
+                                              self._model(config, "healer"), memory=memory)
+            await self._stage_validate(run_id, actions)
+            await self._stage_report(run_id, config, surface, flows, specs, executions, actions)
+            await self._stage_persist_memory(run_id, config, memory, flows, specs, actions)
+
+            await self.db.runs.update_one({"id": run_id}, {"$set": {"status": "completed", "finished_at": now_iso()}})
+            await self.emit(run_id, "REPORT", "meta", "success", "run_complete",
+                            "Rerun from Runner complete. Report generated.")
+        except asyncio.CancelledError:
+            await self.db.runs.update_one({"id": run_id}, {"$set": {
+                "status": "aborted", "error": "aborted by operator", "finished_at": now_iso()}})
+            try:
+                await self.emit(run_id, "REPORT", "meta", "warn", "run_complete", "Run aborted by operator.")
             except Exception:
                 pass
             raise
