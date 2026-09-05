@@ -661,15 +661,19 @@ class Orchestrator:
                              "source_run_id": source_run_id})
             # mark the reused stages "done" (not re-run) and emit one handoff per stage so the DAG
             # and Agent Handoffs feed read the same way a normal run would, just labeled "(reused)".
-            await self.set_stage(run_id, "EXPLORE", "done")
-            await self._handoff(run_id, "EXPLORE", "explorer", "planner", "surface",
-                                f"{len(surface.get('pages', []))} pages (reused)")
-            await self.set_stage(run_id, "PLAN", "done")
-            await self._handoff(run_id, "PLAN", "planner", "evaluator", "flows", f"{len(flows)} flows (reused)")
-            await self.set_stage(run_id, "EVALUATE", "done")
-            await self._handoff(run_id, "EVALUATE", "evaluator", "generator", "evaluation", "reused from source run")
-            await self.set_stage(run_id, "GENERATE", "done")
-            await self._handoff(run_id, "GENERATE", "generator", "runner", "specs", f"{len(specs)} specs (reused)")
+            # set_stage() alone only writes run.stages in Mongo -- the frontend's DAG derives stage
+            # status from stage_complete *events*, not from that field, so without an explicit
+            # stage_complete emit here each reused stage stayed stuck showing "pending" in the DAG
+            # even though it had genuinely already completed.
+            async def _mark_reused(stage, agent, next_agent, artifact, summary):
+                await self.set_stage(run_id, stage, "done")
+                await self.emit(run_id, stage, agent, "success", "stage_complete", f"Reused from run {source_run_id[:8]} — not re-run.")
+                await self._handoff(run_id, stage, agent, next_agent, artifact, summary)
+
+            await _mark_reused("EXPLORE", "explorer", "planner", "surface", f"{len(surface.get('pages', []))} pages (reused)")
+            await _mark_reused("PLAN", "planner", "evaluator", "flows", f"{len(flows)} flows (reused)")
+            await _mark_reused("EVALUATE", "evaluator", "generator", "evaluation", "reused from source run")
+            await _mark_reused("GENERATE", "generator", "runner", "specs", f"{len(specs)} specs (reused)")
             for f in flows:
                 await self.emit(run_id, "PLAN", "planner", "info", "plan_flow", f"[{f['type'].upper()}] {f['name']}", {"flow": f})
             for s in specs:
