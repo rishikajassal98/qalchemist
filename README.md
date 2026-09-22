@@ -34,6 +34,10 @@ the Healer tab — rather than another automatic PLAN/GENERATE/RUN cycle.
 
 **Stack:** React + Tailwind + shadcn/ui · FastAPI (async) · LangGraph · MongoDB · Playwright (Chromium) · Sarvam AI (sarvam-105b)
 
+![QAlchemist run in progress — live DAG, decision stream, and generated test plan](docs/screenshot.png)
+*A completed run: all seven pipeline stages, the live Decision Stream showing the Healer fixing a stale
+locator and re-verifying it in a live replay, and the synthesized test plan.*
+
 ---
 
 ## Architecture
@@ -119,7 +123,7 @@ Install these on your machine first:
 Download / clone your project (see the platform "Save to GitHub" option), then:
 
 ```bash
-cd autoqa            # the project root that contains /backend and /frontend
+cd qalchemist         # the project root that contains /backend and /frontend
 ```
 
 Project layout:
@@ -139,10 +143,8 @@ cd backend
 python3 -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
 
-# install dependencies (requirements.txt is a fully-pinned lockfile: install it with
-# --no-deps so pip doesn't re-resolve the graph, and point it at the Emergent index
-# so emergentintegrations/litellm can be found)
-pip install --no-deps -r requirements.txt --extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/
+# install dependencies (requirements.txt is a pinned lockfile from a known-working install)
+pip install -r requirements.txt
 
 # install the real browser Playwright drives for exploration + test execution
 playwright install chromium
@@ -152,7 +154,7 @@ Create `backend/.env`:
 
 ```env
 MONGO_URL="mongodb://localhost:27017"
-DB_NAME="autoqa"
+DB_NAME="qalchemist"
 CORS_ORIGINS="*"
 SARVAM_API_KEY=sk_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
@@ -226,6 +228,11 @@ App opens at **http://localhost:3000**.
    returning target..." log before EXPLORE even starts — listing known selectors, healed locators, and
    any confirmed regressions carried over from the first run. No extra setup: `agent_memory` is a plain
    MongoDB collection, created automatically on first write.
+6. **Rerun** (top of the state machine, or the ↺ icon on any finished run in the sidebar) re-executes
+   from RUN onward, reusing that run's already-discovered surface, plan and generated specs instead of
+   paying for a fresh EXPLORE crawl and PLAN/EVALUATE/GENERATE LLM calls every time — useful for
+   re-proving a heal still holds, or iterating on a flaky RUN/HEAL result. Falls back to a full run if
+   the source run never got as far as GENERATE.
 
 ---
 
@@ -256,8 +263,6 @@ App opens at **http://localhost:3000**.
 
 | Symptom | Fix |
 |--------|-----|
-| `ModuleNotFoundError: emergentintegrations` | Re-run the install in step 3 with `--extra-index-url` |
-| `ResolutionImpossible` / `resolution-too-deep` on `pip install` | Use the `--no-deps` install command from step 3 — this file is a pinned lockfile, so let pip skip resolution instead of re-solving the graph |
 | `Executable doesn't exist ... chromium` at run time | Run `playwright install chromium` in the backend venv |
 | `NotImplementedError` from `playwright/_impl/_transport.py` / `asyncio/subprocess.py` (Windows only) | Run the backend with `python run.py --reload` instead of the bare `uvicorn` command (see step 3) — the plain CLI can't set the event-loop mode Playwright needs on Windows |
 | Frontend can't reach backend / CORS error | Check `REACT_APP_BACKEND_URL=http://localhost:8001` and that backend is running |
